@@ -1,0 +1,92 @@
+// Async/Await and Concurrency
+use std::time;
+use std::async;
+
+async fn main() -> () {
+    println("Starting async operations...");
+    
+    // Simple async function call
+    let result = await fetch_data("https://api.example.com");
+    println("Fetched: {}", result);
+    
+    // Parallel async operations
+    let future1 = fetch_data("https://api1.example.com");
+    let future2 = fetch_data("https://api2.example.com");
+    let future3 = fetch_data("https://api3.example.com");
+    
+    // Wait for all to complete
+    let (result1, result2, result3) = await (future1, future2, future3);
+    println("All results: {}, {}, {}", result1, result2, result3);
+    
+    // Channels for communication between async tasks
+    let (sender, receiver) = async::channel<String>();
+    
+    // Spawn background task
+    async::spawn(async move {
+        await time::sleep(1000); // Sleep for 1 second
+        await sender.send("Hello from background task!");
+    });
+    
+    // Receive message
+    let message = await receiver.recv();
+    println("Received: {}", message);
+    
+    // Async loops and iteration
+    let urls = [
+        "https://example1.com",
+        "https://example2.com", 
+        "https://example3.com"
+    ];
+    
+    for url in urls {
+        async {
+            let data = await fetch_data(url);
+            println("Data from {}: {}", url, data);
+        }
+    }
+    
+    println("All async operations completed!");
+}
+
+// Async function that simulates network request
+async fn fetch_data(url: String) -> String {
+    println("Fetching data from: {}", url);
+    
+    // Simulate network delay
+    await time::sleep(500);
+    
+    // Return mock data
+    "Mock data from {}".format(url)
+}
+
+// Async function with error handling
+async fn fetch_with_retry(url: String, max_retries: Int) -> Result<String, String> {
+    let mut attempt = 0;
+    
+    while attempt < max_retries {
+        match await try_fetch(url) {
+            Ok(data) => return Ok(data),
+            Err(error) => {
+                attempt = attempt + 1;
+                println("Attempt {} failed: {}", attempt, error);
+                
+                if attempt < max_retries {
+                    await time::sleep(1000); // Wait before retry
+                }
+            }
+        }
+    }
+    
+    Err("Max retries exceeded")
+}
+
+// Helper function that might fail
+async fn try_fetch(url: String) -> Result<String, String> {
+    // Simulate random failure
+    if url.contains("fail") {
+        Err("Network error")
+    } else {
+        await time::sleep(200);
+        Ok("Success data")
+    }
+}

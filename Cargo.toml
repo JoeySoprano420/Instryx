@@ -1,0 +1,115 @@
+[package]
+name = "instryx"
+version = "0.1.0"
+edition = "2021"
+authors = ["Instryx Language Team"]
+description = "A modern systems programming language designed for safety, performance, and expressiveness"
+license = "MIT"
+repository = "https://github.com/JoeySoprano420/Instryx"
+homepage = "https://instryx.dev"
+documentation = "https://docs.instryx.dev"
+keywords = ["programming-language", "compiler", "systems", "memory-safety", "performance"]
+categories = ["compilers", "development-tools"]
+readme = "README.md"
+
+[dependencies]
+# Core dependencies for the language implementation
+
+# Command line interface
+clap = { version = "4.0", features = ["derive"] }
+
+# Serialization for AST and metadata
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Parallel processing
+rayon = "1.7"
+
+# Memory allocation tracking
+mimalloc = { version = "0.1", default-features = false }
+
+# Optional benchmarking
+criterion = { version = "0.5", optional = true }
+
+[dev-dependencies]
+tempfile = "3.0"   # Temporary files for testing
+proptest = "1.0"   # Property-based testing
+
+[features]
+default = ["async", "pattern-matching", "type-inference", "memory-safety"]
+
+# Language feature flags
+async = []
+pattern-matching = []
+type-inference = []
+memory-safety = []
+generic-functions = []
+modules = []
+
+# Target features
+wasm-target = ["wasm-bindgen"]
+js-target = ["js-sys", "web-sys"]
+
+# Development features
+debug-parser = []
+debug-codegen = []
+benchmarking = ["dep:criterion"]
+
+[dependencies.wasm-bindgen]
+version = "0.2"
+optional = true
+
+[dependencies.js-sys]
+version = "0.3"
+optional = true
+
+[dependencies.web-sys]
+version = "0.3"
+optional = true
+
+[[bin]]
+name = "instryx"
+path = "src/main.rs"
+
+[lib]
+name = "instryx"
+path = "src/lib.rs"
+
+[profile.release]
+# Optimize for speed and size
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[profile.dev]
+# Fast compilation during development
+opt-level = 0
+debug = true
+incremental = true
+
+[profile.test]
+# Optimize tests but keep debug info
+opt-level = 1
+debug = true
+
+[workspace]
+members = [
+    ".",
+]
+
+# Workspace configuration for future sub-crates
+[workspace.dependencies]
+instryx = { path = "." }
+
+# Metadata for package managers and tools
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[package.metadata.playground]
+features = ["default"]

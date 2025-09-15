@@ -1,0 +1,5 @@
+// Hello World - The traditional first program
+fn main() -> () {
+    println("Hello, World!");
+    println("Welcome to Instryx!");
+}

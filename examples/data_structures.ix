@@ -1,0 +1,94 @@
+// Data Structures - Structs, Enums, and Pattern Matching
+struct Person {
+    pub name: String,
+    pub age: Int,
+    email: String,
+}
+
+enum Status {
+    Active,
+    Inactive,
+    Pending(String),  // Variant with data
+}
+
+enum Option<T> {
+    Some(T),
+    None,
+}
+
+enum Result<T, E> {
+    Ok(T),
+    Err(E),
+}
+
+fn main() -> () {
+    // Struct creation
+    let person = Person {
+        name: "John Doe",
+        age: 35,
+        email: "john@example.com",
+    };
+    
+    println("Person: {} ({})", person.name, person.age);
+    
+    // Enum usage
+    let status = Status::Pending("Awaiting approval");
+    let user_status = Status::Active;
+    
+    // Pattern matching on enums
+    match status {
+        Status::Active => println("User is active"),
+        Status::Inactive => println("User is inactive"),
+        Status::Pending(reason) => println("User is pending: {}", reason),
+    }
+    
+    // Option type for null safety
+    let maybe_number = Some(42);
+    let nothing = None;
+    
+    match maybe_number {
+        Some(value) => println("Got value: {}", value),
+        None => println("No value"),
+    }
+    
+    // Result type for error handling
+    let division_result = divide(10, 2);
+    match division_result {
+        Ok(value) => println("Division result: {}", value),
+        Err(error) => println("Division error: {}", error),
+    }
+    
+    let error_case = divide(10, 0);
+    match error_case {
+        Ok(value) => println("Division result: {}", value),
+        Err(error) => println("Division error: {}", error),
+    }
+}
+
+// Function that returns a Result
+fn divide(a: Int, b: Int) -> Result<Int, String> {
+    if b == 0 {
+        Err("Division by zero")
+    } else {
+        Ok(a / b)
+    }
+}
+
+// Impl block for methods
+impl Person {
+    // Constructor
+    fn new(name: String, age: Int, email: String) -> Person {
+        Person { name, age, email }
+    }
+    
+    // Method
+    fn is_adult(self) -> Bool {
+        self.age >= 18
+    }
+    
+    // Mutable method
+    fn celebrate_birthday(mut self) -> () {
+        self.age = self.age + 1;
+        println("Happy birthday! You are now {}", self.age);
+    }
+}

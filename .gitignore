@@ -1,0 +1,49 @@
+# Build artifacts
+/target/
+/build/
+/dist/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Package manager files
+node_modules/
+.npm/
+.yarn/
+
+# Temporary files
+/tmp/
+*.tmp
+*.temp
+
+# Test artifacts
+/coverage/
+*.tix
+*.gcda
+*.gcno
+
+# Language specific
+*.ibc
+*.o
+*.hi
+*.dyn_hi
+*.dyn_o
+*.prof
+
+# Documentation build
+/docs/build/

@@ -1,0 +1,56 @@
+// Functions and Control Flow
+fn main() -> () {
+    let x = 10;
+    let y = 20;
+    
+    // Function calls
+    let sum = add(x, y);
+    let product = multiply(x, y);
+    
+    println("Sum: {}, Product: {}", sum, product);
+    
+    // Control flow
+    if sum > 25 {
+        println("Sum is greater than 25");
+    } else {
+        println("Sum is 25 or less");
+    }
+    
+    // Pattern matching (planned feature)
+    match sum {
+        0 => println("Zero"),
+        1..10 => println("Small number"),
+        11..50 => println("Medium number"),
+        _ => println("Large number"),
+    }
+    
+    // Loops
+    for i in 1..5 {
+        println("Count: {}", i);
+    }
+    
+    let mut counter = 0;
+    while counter < 3 {
+        println("Counter: {}", counter);
+        counter = counter + 1;
+    }
+}
+
+// Function definitions
+fn add(a: Int, b: Int) -> Int {
+    a + b
+}
+
+fn multiply(a: Int, b: Int) -> Int {
+    a * b
+}
+
+// Generic function (planned feature)
+fn identity<T>(value: T) -> T {
+    value
+}
+
+// Function with optional parameter
+fn greet(name: String, title: String = "Mr.") -> String {
+    "{} {}, hello!".format(title, name)
+}

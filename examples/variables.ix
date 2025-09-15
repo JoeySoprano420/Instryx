@@ -1,0 +1,25 @@
+// Variables and Types - Demonstrating Instryx's type system
+fn main() -> () {
+    // Immutable variables with type inference
+    let name = "Alice";
+    let age = 30;
+    let height = 5.6;
+    let is_student = false;
+    
+    // Mutable variables
+    let mut counter = 0;
+    counter = counter + 1;
+    
+    // Explicit type annotations
+    let score: Int = 95;
+    let message: String = "Type annotations are optional but helpful";
+    
+    // Collections
+    let numbers = [1, 2, 3, 4, 5];
+    let point = (x: 10, y: 20);
+    
+    // String interpolation (planned feature)
+    println("Name: {}, Age: {}, Counter: {}", name, age, counter);
+    println("Score: {}, Height: {}", score, height);
+    println("Numbers: {:?}, Point: {:?}", numbers, point);
+}
