@@ -1,0 +1,4 @@
+{
+  "name": "keyword.control.instryx",
+  "match": "\\b(quarantine|try|replace|erase|func|main|@inline|@ffi)\\b"
+}
