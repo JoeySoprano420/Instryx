@@ -23,6 +23,15 @@ import functools
 import logging
 from concurrent.futures import ThreadPoolExecutor, Future as ThreadFuture
 from typing import Any, Awaitable, Callable, Dict, Optional, Tuple, List
+from __future__ import annotations
+import asyncio
+import threading
+import time
+import functools
+import logging
+import queue
+import uuid
+import os
 
 LOG = logging.getLogger("instryx.async_runtime")
 if not LOG.handlers:
@@ -2988,13 +2997,4 @@ if __name__ == "__main__":
     - Context manager support and idempotent operations.
     - Safe, dependency-free, uses only stdlib.
     """
-    from __future__ import annotations
-    import asyncio
-    import threading
-    import time
-    import functools
-    import logging
-    import queue
-    import uuid
-    import os
 
