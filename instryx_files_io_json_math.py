@@ -1,4 +1,3 @@
-
 """
 instryx_files_io_json_math.py
 
@@ -8,14 +7,15 @@ Enhancements (production-focused)
 - Streaming+batch JSON loading with ThreadPoolExecutor for concurrency
 - Checksum-backed cache invalidation for cached JSON
 - Duplicate-key detection and optional strict parsing
-- Schema validation with optional coercion of simple types
+- Schema validation with optional coercion of simple types and automatic fixes
 - Fast numeric statistics, optionally accelerated with numpy if installed
 - Safe transform feature: apply a numeric mapping expression (lambda-style) to numeric leaves
 - Directory merge, batch-validate, lint (duplicate keys, trailing commas), format and watch mode
 - Pack/unpack array improved: gzip support, array module optimization
 - File watch (polling) with debounce and callback
 - Export metrics / stats for pipelines
-- Extensive CLI with new commands: format, lint, merge-dir, batch-validate, transform, watch, export-stats
+- Streaming JSON iterator (ijson-backed when available) and schema inference
+- Extensive CLI with new commands: format, lint, merge-dir, batch-validate, transform, watch, export-stats, infer-schema, fix
 - Defensive, atomic and log-rich operations
 
 No mandatory third-party deps; optional acceleration via numpy/ijson when available.
@@ -47,7 +47,7 @@ import difflib
 import ast
 import fnmatch
 import collections
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Callable
 
 # Optional accelerations
 _try_numpy = None
@@ -251,6 +251,34 @@ def cached_json_load(path: str, allow_comments: bool = True, use_cache: bool = T
 
 
 # ---------------------------
+# Streaming JSON (ijson if available) and helpers
+# ---------------------------
+def stream_json_items(path: str, prefix: Optional[str] = None):
+    """
+    Yield top-level JSON items from a file.
+    If ijson is available and file is large, stream; otherwise load into memory.
+    prefix: when streaming arrays, prefix='item' yields array elements.
+    """
+    if _try_ijson:
+        with open(path, "rb") as f:
+            parser = _try_ijson.parse(f)
+            # simple streaming: yield values at prefix if provided
+            for prefix_token, event, value in parser:
+                # when prefix is None, yield top-level completed objects only (approx)
+                if prefix and prefix_token.endswith(prefix) and event in ("string", "number", "boolean", "start_map", "start_array", "null"):
+                    yield value
+            # fallback: nothing
+        return
+    # fallback: load whole file (small files)
+    data = cached_json_load(path)
+    if isinstance(data, list):
+        for it in data:
+            yield it
+    else:
+        yield data
+
+
+# ---------------------------
 # Merge / diff utilities
 # ---------------------------
 def deep_merge(a: Any, b: Any, path: Optional[List[str]] = None) -> Any:
@@ -281,87 +309,66 @@ def json_diff(a: Any, b: Any, pretty: bool = True) -> str:
 
 
 # ---------------------------
-# Schema validation with optional coercion
+# Schema inference (simple)
 # ---------------------------
-def _check_type(value: Any, expected: str) -> bool:
-    mapping = {
-        "object": dict,
-        "array": list,
-        "string": str,
-        "number": (int, float),
-        "integer": int,
-        "boolean": bool,
-        "null": type(None),
-        "any": object,
-    }
-    t = mapping.get(expected)
-    if t is None:
-        return True
-    return isinstance(value, t)
-
-
-def _coerce_simple(value: Any, expected: str) -> Any:
-    if expected == "number":
-        if isinstance(value, (int, float)):
-            return value
-        if isinstance(value, str):
-            try:
-                return float(value)
-            except Exception:
-                return value
-    if expected == "integer":
-        if isinstance(value, int):
-            return value
-        if isinstance(value, str):
-            try:
-                return int(value)
-            except Exception:
-                return value
-    if expected == "boolean":
-        if isinstance(value, bool):
-            return value
-        if isinstance(value, str):
-            s = value.strip().lower()
-            if s in ("true", "1", "yes"):
-                return True
-            if s in ("false", "0", "no"):
-                return False
-    return value
-
-
-def validate_schema(data: Any, schema: Dict[str, Any], coerce: bool = False) -> Tuple[bool, List[str], Any]:
+def infer_schema_from_sample(data: Any, max_items: int = 100) -> Dict[str, Any]:
     """
-    Small validator returning (valid, messages, possibly_coerced_data).
+    Infer a simple JSON schema from a sample object.
+    Produces a shallow schema describing types and array item type when possible.
     """
-    msgs: List[str] = []
+    def infer(node, depth=0):
+        if isinstance(node, dict):
+            props = {}
+            for k, v in node.items():
+                props[k] = infer(v, depth + 1)
+            return {"type": "object", "properties": props}
+        if isinstance(node, list):
+            if not node:
+                return {"type": "array", "items": {"type": "any"}}
+            # infer item types by sampling
+            sample = node[:max_items]
+            types = set()
+            item_schemas = [infer(it, depth + 1) for it in sample]
+            # if all same simple type, use it
+            kind = item_schemas[0].get("type") if item_schemas else "any"
+            if all(s.get("type") == kind for s in item_schemas):
+                return {"type": "array", "items": {"type": kind}}
+            return {"type": "array", "items": {"type": "any"}}
+        if isinstance(node, bool):
+            return {"type": "boolean"}
+        if isinstance(node, int):
+            return {"type": "integer"}
+        if isinstance(node, float):
+            return {"type": "number"}
+        if node is None:
+            return {"type": "null"}
+        return {"type": "string"}
+    return infer(data)
 
-    def _validate(node: Any, sch: Dict[str, Any], path: str):
-        typ = sch.get("type")
-        local = node
-        if typ:
-            if coerce:
-                local = _coerce_simple(local, typ)
-            if not _check_type(local, typ):
-                msgs.append(f"{path or 'root'}: expected {typ}, got {type(local).__name__}")
-                return local
-        if typ == "object" and isinstance(local, dict):
-            props = sch.get("properties", {})
-            req = sch.get("required", [])
-            for r in req:
-                if r not in local:
-                    msgs.append(f"{path or 'root'}: missing required property '{r}'")
-            for k, v in list(local.items()):
-                if k in props:
-                    local[k] = _validate(v, props[k], f"{path}.{k}" if path else k)
-        elif typ == "array" and isinstance(local, list):
-            items_sch = sch.get("items")
-            if items_sch:
-                for idx, it in enumerate(local):
-                    local[idx] = _validate(it, items_sch, f"{path}[{idx}]")
-        return local
 
-    coerced = _validate(data, schema, "")
-    return (len(msgs) == 0, msgs, coerced)
+# ---------------------------
+# Schema validation with optional coercion and auto-fix defaults
+# ---------------------------
+def _apply_defaults(node: Any, sch: Dict[str, Any]):
+    """
+    If schema provides 'default' values for missing properties, apply them.
+    """
+    if not isinstance(node, dict) or sch.get("type") != "object":
+        return node
+    props = sch.get("properties", {})
+    for k, ps in props.items():
+        if k not in node and "default" in ps:
+            node[k] = ps["default"]
+        elif k in node:
+            _apply_defaults(node[k], ps)
+    return node
+
+
+def validate_and_fix(data: Any, schema: Dict[str, Any], coerce: bool = False, apply_defaults: bool = True) -> Tuple[bool, List[str], Any]:
+    ok, msgs, coerced = validate_schema(data, schema, coerce=coerce)
+    if apply_defaults:
+        coerced = _apply_defaults(coerced, schema)
+    return ok, msgs, coerced
 
 
 # ---------------------------
@@ -459,6 +466,7 @@ def pack_float_array(path: str, arr: Iterable[float], fmt: str = "f", endian: st
             magic = b"IFLT"
             f.write(magic)
             f.write(struct.pack("<I", 1 if fmt_char == "f" else 2))
+            # reserve 8 bytes for count
             f.write(struct.pack("<Q", 0))
             count = 0
             for v in arr:
@@ -703,6 +711,15 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--ext", default=".json")
     sp.add_argument("--workers", type=int, default=4)
 
+    sp = sub.add_parser("infer-schema", help="Infer a simple JSON schema from a sample file")
+    sp.add_argument("file")
+    sp.add_argument("--out", "-o", help="write inferred schema to file")
+
+    sp = sub.add_parser("fix", help="Validate and attempt to fix JSON using schema (coercion + defaults)")
+    sp.add_argument("file")
+    sp.add_argument("--schema", "-s", required=True)
+    sp.add_argument("--out", "-o", help="write fixed JSON to path (atomic)")
+
     return p
 
 
@@ -879,6 +896,32 @@ def main(argv: Optional[List[str]] = None):
                         summary[p] = {"error": str(e)}
             json_write(args.out, summary, pretty=True)
             print("wrote", args.out)
+            return 0
+
+        if args.cmd == "infer-schema":
+            data = cached_json_load(args.file)
+            schema = infer_schema_from_sample(data)
+            out = json_dumps(schema, pretty=True)
+            if args.out:
+                atomic_write(args.out, out)
+                print("wrote", args.out)
+            else:
+                print(out)
+            return 0
+
+        if args.cmd == "fix":
+            data = cached_json_load(args.file)
+            schema = cached_json_load(args.schema)
+            ok, msgs, fixed = validate_and_fix(data, schema, coerce=True, apply_defaults=True)
+            if not ok:
+                print("FIXED (issues remain):")
+                for m in msgs:
+                    print("-", m)
+            else:
+                print("OK or fixed successfully")
+            outpath = args.out or args.file
+            json_write(outpath, fixed, pretty=True)
+            print("wrote", outpath)
             return 0
 
         print("unknown command", args.cmd)
