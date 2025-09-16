@@ -3,22 +3,22 @@ instryx_files_io_json_math.py
 
 Robust file / JSON I/O and numeric utilities used by Instryx tooling.
 
-Enhancements (production-focused)
-- Streaming+batch JSON loading with ThreadPoolExecutor for concurrency
-- Checksum-backed cache invalidation for cached JSON
-- Duplicate-key detection and optional strict parsing
-- Schema validation with optional coercion of simple types and automatic fixes
-- Fast numeric statistics, optionally accelerated with numpy if installed
-- Safe transform feature: apply a numeric mapping expression (lambda-style) to numeric leaves
-- Directory merge, batch-validate, lint (duplicate keys, trailing commas), format and watch mode
-- Pack/unpack array improved: gzip support, array module optimization
-- File watch (polling) with debounce and callback
-- Export metrics / stats for pipelines
-- Streaming JSON iterator (ijson-backed when available) and schema inference
-- Extensive CLI with new commands: format, lint, merge-dir, batch-validate, transform, watch, export-stats, infer-schema, fix
-- Defensive, atomic and log-rich operations
+This file is an enhanced, production-minded implementation offering:
+- Safe atomic reads/writes (gzip aware), backup support
+- Tolerant JSON parsing (comment stripping), duplicate-key detection
+- Checksum-backed cache for parsed files with invalidation
+- Streaming JSON iterator using ijson when available
+- Fast numeric statistics (one-pass Welford + optional numpy acceleration)
+- Safe numeric-transform expressions compiled from AST (no builtins)
+- Pack/unpack of float arrays (portable binary format, gzip optional)
+- Directory utilities: merge, merge-dir, batch-load, batch-validate, merge-fast (streaming)
+- Lint/format helpers, schema inference, validate-and-fix (coercion + defaults)
+- File watch (threaded, debounced) with stoppable watcher
+- CLI with many commands including profile, normalize, compact, infer-schema, fix
+- Lightweight runtime metrics and profiling helpers
+- Defensive error handling and detailed logging
 
-No mandatory third-party deps; optional acceleration via numpy/ijson when available.
+No required third-party dependencies. Optional accelerations: numpy, ijson.
 
 Usage examples:
   python instryx_files_io_json_math.py format file.json --inplace
@@ -47,6 +47,7 @@ import difflib
 import ast
 import fnmatch
 import collections
+import statistics
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Callable
 
 # Optional accelerations
@@ -70,15 +71,39 @@ if not LOG.handlers:
 
 
 # ---------------------------
+# Lightweight runtime metrics
+# ---------------------------
+_metrics_lock = threading.RLock()
+_metrics: Dict[str, Any] = {"calls": {}, "timings": {}}
+
+
+def record_metric(name: str, value: float):
+    with _metrics_lock:
+        _metrics.setdefault("calls", {}).setdefault(name, 0)
+        _metrics["calls"][name] += 1
+        _metrics.setdefault("timings", {}).setdefault(name, 0.0)
+        _metrics["timings"][name] += float(value)
+
+
+def export_metrics() -> Dict[str, Any]:
+    with _metrics_lock:
+        return json.loads(json.dumps(_metrics))
+
+
+# ---------------------------
 # Utilities: atomic IO + safe read/write (gzip aware)
 # ---------------------------
 def safe_read(path: str, encoding: str = "utf-8") -> str:
     """Read file content safely; supports gzip (.gz)."""
-    if path.endswith(".gz"):
-        with gzip.open(path, "rt", encoding=encoding) as f:
+    start = time.time()
+    try:
+        if path.endswith(".gz"):
+            with gzip.open(path, "rt", encoding=encoding) as f:
+                return f.read()
+        with open(path, "r", encoding=encoding, errors="strict") as f:
             return f.read()
-    with open(path, "r", encoding=encoding, errors="strict") as f:
-        return f.read()
+    finally:
+        record_metric("safe_read", time.time() - start)
 
 
 def atomic_write(path: str, data: str, encoding: str = "utf-8", backup: bool = True) -> str:
@@ -87,6 +112,7 @@ def atomic_write(path: str, data: str, encoding: str = "utf-8", backup: bool = T
     Supports writing to .gz by compressing.
     Returns target path on success.
     """
+    start = time.time()
     dirp = os.path.dirname(path) or "."
     fd, tmp = tempfile.mkstemp(dir=dirp, text=False)
     os.close(fd)
@@ -102,12 +128,8 @@ def atomic_write(path: str, data: str, encoding: str = "utf-8", backup: bool = T
             shutil.copy2(path, bak)
         os.replace(tmp, path)
         return path
-    except Exception:
-        try:
-            os.unlink(tmp)
-        except Exception:
-            pass
-        raise
+    finally:
+        record_metric("atomic_write", time.time() - start)
 
 
 # ---------------------------
@@ -193,12 +215,7 @@ def json_dumps(data: Any, pretty: bool = True, sort_keys: bool = True, indent: i
 
 def json_write(path: str, obj: Any, pretty: bool = True, atomic: bool = True, backup: bool = True) -> str:
     content = json_dumps(obj, pretty=pretty)
-    if atomic:
-        return atomic_write(path, content, backup=backup)
-    else:
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(content)
-        return path
+    return atomic_write(path, content, backup=backup) if atomic else (open(path, "w", encoding="utf-8").write(content) or path)
 
 
 # ---------------------------
@@ -207,7 +224,7 @@ def json_write(path: str, obj: Any, pretty: bool = True, atomic: bool = True, ba
 class ChecksumCache:
     def __init__(self):
         self.lock = threading.RLock()
-        self._map: Dict[str, Tuple[str, Any]] = {}
+        self._map: Dict[str, Tuple[str, Any, float]] = {}  # (checksum, data, timestamp)
 
     def get(self, path: str, checksum: str):
         with self.lock:
@@ -220,11 +237,18 @@ class ChecksumCache:
 
     def set(self, path: str, checksum: str, data: Any):
         with self.lock:
-            self._map[path] = (checksum, data)
+            self._map[path] = (checksum, data, time.time())
 
     def invalidate(self, path: str):
         with self.lock:
             self._map.pop(path, None)
+
+    def prune_older_than(self, seconds: float = 3600.0):
+        with self.lock:
+            now = time.time()
+            for k, v in list(self._map.items()):
+                if now - v[2] > seconds:
+                    self._map.pop(k, None)
 
 
 _checksum_cache = ChecksumCache()
@@ -253,23 +277,27 @@ def cached_json_load(path: str, allow_comments: bool = True, use_cache: bool = T
 # ---------------------------
 # Streaming JSON (ijson if available) and helpers
 # ---------------------------
-def stream_json_items(path: str, prefix: Optional[str] = None):
+def stream_json_items(path: str, array_prefix: str = "item"):
     """
-    Yield top-level JSON items from a file.
-    If ijson is available and file is large, stream; otherwise load into memory.
-    prefix: when streaming arrays, prefix='item' yields array elements.
+    Yield items from a JSON array or top-level object in a streaming manner.
+    Uses ijson if available; otherwise falls back to loading the file.
+    For arrays, yield each element; for objects, yield the object itself.
     """
     if _try_ijson:
         with open(path, "rb") as f:
-            parser = _try_ijson.parse(f)
-            # simple streaming: yield values at prefix if provided
-            for prefix_token, event, value in parser:
-                # when prefix is None, yield top-level completed objects only (approx)
-                if prefix and prefix_token.endswith(prefix) and event in ("string", "number", "boolean", "start_map", "start_array", "null"):
-                    yield value
-            # fallback: nothing
-        return
-    # fallback: load whole file (small files)
+            size = os.path.getsize(path)
+            # try stream array items first
+            try:
+                for item in _try_ijson.items(f, "item"):
+                    yield item
+                return
+            except Exception:
+                f.seek(0)
+                # parse top-level maps incrementally
+                parser = _try_ijson.parse(f)
+                current = None
+                # fallback streaming is complex; return loaded object as last resort
+            # fallback to full load below
     data = cached_json_load(path)
     if isinstance(data, list):
         for it in data:
@@ -325,11 +353,8 @@ def infer_schema_from_sample(data: Any, max_items: int = 100) -> Dict[str, Any]:
         if isinstance(node, list):
             if not node:
                 return {"type": "array", "items": {"type": "any"}}
-            # infer item types by sampling
             sample = node[:max_items]
-            types = set()
             item_schemas = [infer(it, depth + 1) for it in sample]
-            # if all same simple type, use it
             kind = item_schemas[0].get("type") if item_schemas else "any"
             if all(s.get("type") == kind for s in item_schemas):
                 return {"type": "array", "items": {"type": kind}}
@@ -386,27 +411,37 @@ def _iter_numbers(obj: Any) -> Iterable[float]:
 
 
 def numeric_stats(data: Any) -> Dict[str, Any]:
-    nums = list(_iter_numbers(data))
-    if not nums:
+    """
+    Fast numeric stats: one-pass Welford algorithm for mean/std, optional numpy median.
+    """
+    # one-pass Welford
+    n = 0
+    mean = 0.0
+    M2 = 0.0
+    minv = None
+    maxv = None
+    for x in _iter_numbers(data):
+        n += 1
+        dx = x - mean
+        mean += dx / n
+        M2 += dx * (x - mean)
+        if minv is None or x < minv:
+            minv = x
+        if maxv is None or x > maxv:
+            maxv = x
+    if n == 0:
         return {"count": 0}
-    n = len(nums)
-    s = sum(nums)
-    mean = s / n
-    var = sum((x - mean) ** 2 for x in nums) / n
-    res = {
-        "count": n,
-        "sum": s,
-        "min": min(nums),
-        "max": max(nums),
-        "mean": mean,
-        "std": math.sqrt(var),
-    }
-    if _try_numpy and len(nums) > 1024:
-        try:
-            arr = _try_numpy.array(nums, dtype=_try_numpy.float64)
-            res["median"] = float(_try_numpy.median(arr))
-        except Exception:
-            pass
+    var = M2 / n if n > 0 else 0.0
+    res = {"count": n, "sum": mean * n, "min": minv, "max": maxv, "mean": mean, "std": math.sqrt(var)}
+    # median: try numpy or statistics
+    try:
+        nums = list(_iter_numbers(data))
+        if _try_numpy and len(nums) > 1024:
+            res["median"] = float(_try_numpy.median(_try_numpy.array(nums)))
+        else:
+            res["median"] = statistics.median(nums)
+    except Exception:
+        pass
     return res
 
 
@@ -540,6 +575,37 @@ def format_json_text(text: str, sort_keys: bool = True, indent: int = 2) -> str:
     return json_dumps(obj, pretty=True, sort_keys=sort_keys, indent=indent)
 
 
+def normalize_json(obj: Any, remove_nulls: bool = False) -> Any:
+    """Canonicalize JSON: sort maps, optionally remove nulls."""
+    if isinstance(obj, dict):
+        items = {}
+        for k in sorted(obj.keys()):
+            v = normalize_json(obj[k], remove_nulls=remove_nulls)
+            if remove_nulls and v is None:
+                continue
+            items[k] = v
+        return items
+    if isinstance(obj, list):
+        return [normalize_json(x, remove_nulls=remove_nulls) for x in obj]
+    return obj
+
+
+def compact_json(obj: Any) -> Any:
+    """Remove empty containers and nulls recursively (best-effort)."""
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            v2 = compact_json(v)
+            if v2 is None or v2 == {} or v2 == []:
+                continue
+            out[k] = v2
+        return out
+    if isinstance(obj, list):
+        out = [compact_json(x) for x in obj]
+        return [x for x in out if x is not None and x != {} and x != []]
+    return obj
+
+
 # ---------------------------
 # Batch and directory operations
 # ---------------------------
@@ -592,21 +658,69 @@ def merge_dir(out: str, dirpath: str, ext: str = ".json", strategy: str = "deep"
     return out
 
 
-# ---------------------------
-# File watch (polling) with debounce
-# ---------------------------
-def watch_dir(path: str, callback: Callable[[str], None], ext: str = ".json", interval: float = 1.0, debounce: float = 0.5):
+def merge_fast(out: str, dirpath: str, ext: str = ".json") -> str:
     """
-    Poll directory for changes and call callback(file) when file changed.
-    Simple, dependency-free watcher.
+    Streaming merge for directories containing many JSON array files: merges top-level arrays by streaming.
+    If files are objects, falls back to deep merge.
     """
-    mtimes: Dict[str, float] = {}
-    pending: Dict[str, float] = {}
-    try:
-        while True:
-            for root, _, fns in os.walk(path):
+    accumulated = None
+    files = []
+    for root, _, fns in os.walk(dirpath):
+        for fn in fns:
+            if fn.endswith(ext):
+                files.append(os.path.join(root, fn))
+    files.sort()
+    for p in files:
+        try:
+            # attempt to stream items and treat as array
+            items = list(stream_json_items(p))
+            if isinstance(items, list) and items and accumulated is None:
+                accumulated = []  # initialize as array merge
+            if isinstance(accumulated, list) and isinstance(items, list):
+                accumulated.extend(items)
+            else:
+                d = cached_json_load(p)
+                if accumulated is None:
+                    accumulated = d
+                else:
+                    accumulated = deep_merge(accumulated, d)
+        except Exception:
+            LOG.exception("merge_fast failed for %s", p)
+    if accumulated is None:
+        accumulated = {}
+    json_write(out, accumulated, pretty=True)
+    LOG.info("merge_fast wrote -> %s", out)
+    return out
+
+
+# ---------------------------
+# File watch (threaded) with debounce, stoppable
+# ---------------------------
+class Watcher:
+    def __init__(self, path: str, callback: Callable[[str], None], ext: str = ".json", interval: float = 1.0, debounce: float = 0.5):
+        self.path = path
+        self.callback = callback
+        self.ext = ext
+        self.interval = interval
+        self.debounce = debounce
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self):
+        self._thread.start()
+        return self
+
+    def stop(self):
+        self._stop.set()
+        self._thread.join(timeout=2.0)
+
+    def _run(self):
+        mtimes: Dict[str, float] = {}
+        pending: Dict[str, float] = {}
+        while not self._stop.is_set():
+            for root, _, fns in os.walk(self.path):
                 for fn in fns:
-                    if not fn.endswith(ext):
+                    if not fn.endswith(self.ext):
                         continue
                     p = os.path.join(root, fn)
                     try:
@@ -621,15 +735,13 @@ def watch_dir(path: str, callback: Callable[[str], None], ext: str = ".json", in
                         mtimes[p] = m
             now = time.time()
             for p, t0 in list(pending.items()):
-                if now - t0 >= debounce:
+                if now - t0 >= self.debounce:
                     try:
-                        callback(p)
+                        self.callback(p)
                     except Exception:
                         LOG.exception("watch callback failed for %s", p)
                     pending.pop(p, None)
-            time.sleep(interval)
-    except KeyboardInterrupt:
-        LOG.info("watch stopped")
+            time.sleep(self.interval)
 
 
 # ---------------------------
@@ -658,6 +770,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("dir")
     sp.add_argument("--ext", default=".json")
     sp.add_argument("--strategy", choices=("deep", "overwrite"), default="deep")
+
+    sp = sub.add_parser("merge-fast", help="Streaming merge directory (fast for arrays)")
+    sp.add_argument("out")
+    sp.add_argument("dir")
+    sp.add_argument("--ext", default=".json")
 
     sp = sub.add_parser("diff", help="Diff two JSON files")
     sp.add_argument("a")
@@ -720,6 +837,19 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--schema", "-s", required=True)
     sp.add_argument("--out", "-o", help="write fixed JSON to path (atomic)")
 
+    sp = sub.add_parser("normalize", help="Normalize JSON (sort keys, remove nulls optionally)")
+    sp.add_argument("infile")
+    sp.add_argument("--out", "-o", help="output path")
+    sp.add_argument("--remove-nulls", action="store_true")
+
+    sp = sub.add_parser("compact", help="Compact JSON (remove empty containers and nulls)")
+    sp.add_argument("infile")
+    sp.add_argument("--out", "-o", help="output path")
+
+    sp = sub.add_parser("profile", help="Profile JSON load time")
+    sp.add_argument("file")
+    sp.add_argument("--iter", type=int, default=3)
+
     return p
 
 
@@ -773,6 +903,10 @@ def main(argv: Optional[List[str]] = None):
 
         if args.cmd == "merge-dir":
             merge_dir(args.out, args.dir, ext=args.ext, strategy=args.strategy)
+            return 0
+
+        if args.cmd == "merge-fast":
+            merge_fast(args.out, args.dir, ext=args.ext)
             return 0
 
         if args.cmd == "diff":
@@ -875,7 +1009,13 @@ def main(argv: Optional[List[str]] = None):
         if args.cmd == "watch":
             def cb(p):
                 print("changed:", p)
-            watch_dir(args.dir, cb, ext=args.ext, interval=args.interval, debounce=args.debounce)
+            w = Watcher(args.dir, cb, ext=args.ext, interval=args.interval, debounce=args.debounce)
+            w.start()
+            try:
+                while True:
+                    time.sleep(0.5)
+            except KeyboardInterrupt:
+                w.stop()
             return 0
 
         if args.cmd == "export-stats":
@@ -922,6 +1062,31 @@ def main(argv: Optional[List[str]] = None):
             outpath = args.out or args.file
             json_write(outpath, fixed, pretty=True)
             print("wrote", outpath)
+            return 0
+
+        if args.cmd == "normalize":
+            data = cached_json_load(args.infile)
+            out = normalize_json(data, remove_nulls=args.remove_nulls)
+            outpath = args.out or args.infile
+            json_write(outpath, out, pretty=True)
+            print("wrote", outpath)
+            return 0
+
+        if args.cmd == "compact":
+            data = cached_json_load(args.infile)
+            out = compact_json(data)
+            outpath = args.out or args.infile
+            json_write(outpath, out, pretty=True)
+            print("wrote", outpath)
+            return 0
+
+        if args.cmd == "profile":
+            times = []
+            for _ in range(args.iter):
+                t0 = time.time()
+                cached_json_load(args.file, use_cache=False)
+                times.append(time.time() - t0)
+            print("times:", times, "avg:", sum(times) / len(times))
             return 0
 
         print("unknown command", args.cmd)
