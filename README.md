@@ -1003,3 +1003,852 @@ Instryx solves these with:
 ---
 
 
+The **Instryx programming language** is a radically modern, instruction-oriented, cross-platform language that can be formally categorized as:
+
+---
+
+## 🧠 **Instryx is a:**
+
+| Category                                        | Description                                                                                                         |
+| ----------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| **Instructional Language**                      | Every line is an explicit command to the machine; avoids abstraction confusion.                                     |
+| **Directive-Based Programming Model**           | Uses *semantically directive syntax* (`print:`, `quarantine try`, `@inject`, etc.).                                 |
+| **Cross-Paradigm Hybrid**                       | Fuses imperative, functional, declarative, and parallel programming modes.                                          |
+| **CIAMS-Driven Language**                       | Supports **Contextual Inference Abstraction Macro System**, enabling AI-guided codeflow and macro suggestion.       |
+| **Quarantine-Safe Language**                    | Replaces exception handling with `quarantine → try / replace / erase` blocks for *zero-crash philosophy*.           |
+| **Instruction-Oriented Execution Model**        | Executes by navigating explicit AST instructions (Dodecagram-based).                                                |
+| **Statically Structured, Dynamically Runnable** | Compile-time instruction trees, runtime flow control, dynamic macro expansion.                                      |
+| **AOT + JIT Compatible**                        | Compiles to LLVM IR, WASM, or native binaries; also supports JIT execution.                                         |
+| **Macro-Augmented Language**                    | Extensible through learnable and user-defined macros; syntax and semantics can evolve per project.                  |
+| **Multitarget Emission Language**               | Emits `.exe`, `.wasm`, `.bin`, `.elf`, `.hex`, `.so`, etc., supporting everything from servers to microcontrollers. |
+
+---
+
+## 🧬 **Philosophical Core**
+
+Instryx is designed around the idea that programming should be:
+
+| Principle                   | Manifestation in Instryx                                                  |
+| --------------------------- | ------------------------------------------------------------------------- |
+| **Instructive**             | You tell the machine *exactly* what to do—no magic.                       |
+| **Crashless**               | Errors are handled predictively and recoverably.                          |
+| **Predictable**             | No hidden memory models, no implicit behavior.                            |
+| **Extendable**              | CIAMS macros let you evolve the language as you use it.                   |
+| **Portable**                | Same source emits to native, WASM, or embedded.                           |
+| **Optimized for Cognition** | Language reads like intentional prose, aligns with human logic reasoning. |
+
+---
+
+## 🔠 **Typology Summary**
+
+| Feature Type       | Instryx                                                        |
+| ------------------ | -------------------------------------------------------------- |
+| Paradigm           | Instructional + Directive + Multi-paradigm                     |
+| Type System        | Strong, Explicit, Inferred (in future)                         |
+| Execution          | AST-walk + LLVM JIT + AOT                                      |
+| Memory Model       | Explicit scoped memory + smart pointers + GC (optional)        |
+| Syntax Style       | Semicolon-separated, block-delimited, directive-first          |
+| Macro System       | CIAMS (AI + user-defined macro expansion + context prediction) |
+| Backend Targets    | LLVM IR → `.exe`, `.wasm`, `.so`, `.elf`, `.bin`, `.hex`, etc. |
+| Visual Tooling     | Dodecagram-based AST and macro visualizer                      |
+| Domain Flexibility | System, Embedded, Web, Network, Educational, Scientific        |
+| Interop            | C ABI, WASM ABI, JSON, Python, etc.                            |
+
+---
+
+## 🧭 TL;DR: Instryx is...
+
+> **A crashless, instructional, macro-intelligent, compiler-optimized execution language** that speaks in **directives**, evolves through **macro learning**, and runs **anywhere—fast, safely, and visibly**.
+
+---
+
+
+
+---
+
+## 🔮 What is a **Dodecagram**?
+
+A **Dodecagram** is:
+
+> A **12-branch symbolic logic unit** that serves as the foundational **AST (Abstract Syntax Tree) architecture** in Instryx — enabling deep parsing, concurrent optimization, and dynamic visualization of programs.
+
+It’s named from:
+
+* **“Dodeca-”** = 12
+* **“-gram”** = written form or structure
+* 🔁 Inspired by *dodecahedrons* (12-sided Platonic solids) and *symbolic pattern grammars*
+
+---
+
+## 🧠 In Plain Terms:
+
+> A Dodecagram is like a **logic crystal** that contains up to 12 paths of meaning, action, or flow for any node in a program — and it **forces clarity, concurrency, and completeness**.
+
+Instead of traditional left-right ASTs (binary), or N-ary trees with arbitrary fanout, **Instryx uses a fixed-base-12 model** per logical node. This guarantees:
+
+* **Balance**
+* **Parallelism**
+* **Introspectability**
+
+---
+
+## 🧬 Structural Breakdown
+
+### Each Dodecagram Node Contains:
+
+| Element        | Description                                           |
+| -------------- | ----------------------------------------------------- |
+| `𝕘` (Genesis) | Root node identifier                                  |
+| `𝕓0–𝕓11`     | 12 branches: indexed `𝕓0`, `𝕓1`, ..., `𝕓11`        |
+| `value`        | The payload (e.g., `func`, `print`, `assign`, `data`) |
+| `node_type`    | e.g., `"Function"`, `"Call"`, `"Assign"`, `"Block"`   |
+
+---
+
+### 🧩 Example (Simplified)
+
+```json
+{
+  "𝕘": {
+    "node_type": "Main",
+    "value": null,
+    "𝕓0": {
+      "node_type": "Call",
+      "value": "greet",
+      "𝕓0": {
+        "node_type": "Number",
+        "value": "42"
+      }
+    }
+  }
+}
+```
+
+---
+
+## 🔄 Why 12 Branches?
+
+### Practical Benefits:
+
+| Reason                       | Benefit                                                                                    |
+| ---------------------------- | ------------------------------------------------------------------------------------------ |
+| 🔁 **Parallel Processing**   | Aligns with thread-pool execution (12-core, 12-path match)                                 |
+| 🔎 **Symbolic Clarity**      | Every branch can represent a known semantic zone (e.g., condition, action, fallback, etc.) |
+| 📦 **Compression**           | Facilitates optimized IR/codegen layouts with fixed-width lookup tables                    |
+| 🔌 **Predictable Traversal** | AST tools and interpreters can loop over a fixed-width schema                              |
+| 🧱 **Composable Nodes**      | Nested dodecagrams can recurse with clear structure                                        |
+
+---
+
+## 🛠️ Runtime Application
+
+In the **Instryx runtime**:
+
+* Every function, macro, loop, condition, etc., is parsed into a **Dodecagram AST node**
+* Each node can be evaluated **in isolation or in parallel**
+* Hot-path optimization can occur by **analyzing which branches are active most often**
+
+---
+
+## 📊 Dodecagram as Optimizer Substrate
+
+With this architecture, Instryx can:
+
+* **Assign execution weights to branches** (`𝕓0` gets 89%, `𝕓4` gets 4%, etc.)
+* **Promote or rewire branches** to optimize for concurrency
+* **Visualize execution flow** in a radial, intuitive manner
+
+> The Dodecagram is not just an AST model — it’s a **language DNA format**.
+
+---
+
+## 🌐 How it Translates to Codegen
+
+| Dodecagram AST          | Compiled LLVM IR / WASM                           |
+| ----------------------- | ------------------------------------------------- |
+| Branch index `𝕓0`      | First operand / condition                         |
+| Branch index `𝕓1`      | Then-block                                        |
+| Branch index `𝕓2`      | Else-block                                        |
+| Branch index `𝕓3`      | Catch/retry/timeout                               |
+| Branch index `𝕓4-𝕓11` | Metadata, macros, diagnostics, optimization flags |
+
+---
+
+## 🎨 Visual Representation
+
+Dodecagrams can be drawn as **radial glyphs**:
+
+```
+         𝕓2
+      /     \\
+  𝕓1         𝕓3
+   |    𝕘    |
+  𝕓0         𝕓4
+      \\     /
+         ...
+```
+
+* Visual tools like Graphviz or radial SVGs can render them interactively
+* Each spoke = a branch in logic
+
+---
+
+## 📚 TL;DR
+
+> A **Dodecagram** is a **12-branched logic structure** that makes Instryx code **executable, visual, concurrent, and expandable**.
+
+It’s:
+
+* A **tree node** in the compiler
+* A **visual glyph** in the IDE
+* A **parallel instruction unit** in the runtime
+
+---
+
+
+
+
+---
+
+# 🧠 **Instryx Language — Full Instructional and How-To Guide**
+
+📘 Date: **2025-09-16**
+
+---
+
+## 📖 Table of Contents
+
+1. [Introduction](#1-introduction)
+2. [Installation & Setup](#2-installation--setup)
+3. [Hello World in Instryx](#3-hello-world-in-instryx)
+4. [Core Syntax and Semantics](#4-core-syntax-and-semantics)
+5. [Functions, Blocks, and Main Entry](#5-functions-blocks-and-main-entry)
+6. [CIAMS Macros: Declarative Power](#6-ciams-macros-declarative-power)
+7. [Quarantine: Fail-Safe Error Handling](#7-quarantine-fail-safe-error-handling)
+8. [Dodecagram AST Model](#8-dodecagram-ast-model)
+9. [Interpreter vs LLVM Execution](#9-interpreter-vs-llvm-execution)
+10. [Building Native Executables](#10-building-native-executables)
+11. [Exporting WASM](#11-exporting-wasm)
+12. [Visualizing the AST](#12-visualizing-the-ast)
+13. [JIT Execution Mode](#13-jit-execution-mode)
+14. [Advanced Topics](#14-advanced-topics)
+15. [CIAMS AI Engine: Smart Macro Assistant](#15-ciams-ai-engine-smart-macro-assistant)
+16. [Plugin System and Extensions](#16-plugin-system-and-extensions)
+17. [Multilingual Tokens and Unicode Identifiers](#17-multilingual-tokens-and-unicode-identifiers)
+18. [Instryx Project Layout](#18-instryx-project-layout)
+19. [DevOps and Batch Compilation](#19-devops-and-batch-compilation)
+20. [Security, Signing, and Sandboxing](#20-security-signing-and-sandboxing)
+21. [Future Features and Experimental Modes](#21-future-features-and-experimental-modes)
+
+---
+
+## 1. 🧠 Introduction
+
+**Instryx** is a crash-proof, directive-first, instruction-oriented programming language that compiles to **LLVM IR**, **WASM**, and native executables.
+
+* **Instructional**: Every line is a command to the machine.
+* **Visualizable**: Code forms a radial 12-branch AST: the *Dodecagram*.
+* **Safe**: Built-in macro system prevents crashes using `quarantine try/replace/erase`.
+* **Executable**: Compiles to `.exe`, `.wasm`, `.bin`, `.elf` — or runs via JIT.
+
+---
+
+## 2. ⚙️ Installation & Setup
+
+```bash
+git clone https://github.com/YourRepo/InstryxLang.git
+cd InstryxLang
+pip install -r requirements.txt
+```
+
+Dependencies:
+
+* Python 3.10+
+* llvmlite
+* graphviz
+* LLVM toolchain (`clang`, `llc`, `wasm-ld`)
+* Optional: `torch` for CIAMS AI macro predictions
+
+---
+
+## 3. 👋 Hello World in Instryx
+
+```instryx
+func greet(uid) {
+    print: "Hello, Instryx!";
+};
+
+main() {
+    greet(42);
+};
+```
+
+Run it:
+
+```bash
+python cli/instryxc.py hello.ix --run
+```
+
+---
+
+## 4. 🔤 Core Syntax and Semantics
+
+| Feature      | Syntax                                 |
+| ------------ | -------------------------------------- |
+| Function     | `func name(params) { ... };`           |
+| Entry Point  | `main() { ... };`                      |
+| Assignment   | `x = 5;`                               |
+| Call         | `do_something(1);`                     |
+| String Print | `print: "Hello";`                      |
+| Logging      | `log("status");`                       |
+| Error Alert  | `alert("Oops");`                       |
+| End of stmt  | Always ends with `;` (not indentation) |
+
+---
+
+## 5. 🧱 Functions, Blocks, and Main Entry
+
+Instryx uses:
+
+* `{}` blocks (no indentation)
+* Semicolon-terminated lines
+* Chicago-style spacing
+
+```instryx
+func calculate(a, b) {
+    result = a + b;
+    print: result;
+};
+```
+
+---
+
+## 6. 📦 CIAMS Macros: Declarative Power
+
+### Built-In Macros
+
+```instryx
+@inject db.conn;
+@ffi func native_add(a, b);
+@memoize expensive_calc;
+@wraptry do_thing();
+```
+
+These get **automatically expanded** during compilation or interpretation.
+
+---
+
+## 7. 🛡️ Quarantine: Fail-Safe Error Handling
+
+```instryx
+quarantine try {
+    risky();
+} replace {
+    retry();
+} erase {
+    alert("failure");
+};
+```
+
+Instryx never throws or crashes. It always recovers gracefully.
+
+---
+
+## 8. 🌀 Dodecagram AST Model
+
+Instryx AST is a **12-branch tree per node**. Useful for:
+
+* Parallel traversal
+* Visual debugging
+* Hot-path optimization
+
+Export:
+
+```bash
+python cli/instryxc.py mycode.ix --emit visual -o mycode_ast
+```
+
+---
+
+## 9. 🧮 Interpreter vs LLVM Execution
+
+You can:
+
+* Interpret quickly for testing:
+
+  ```bash
+  --emit interpret
+  ```
+
+* Compile to LLVM and run:
+
+  ```bash
+  --emit llvm
+  ```
+
+* JIT execute native IR:
+
+  ```bash
+  --run
+  ```
+
+---
+
+## 10. 🧪 Building Native Executables
+
+```bash
+python cli/instryxc.py mycode.ix --emit exe -o myapp
+./build/myapp.exe
+```
+
+---
+
+## 11. 🌐 Exporting WASM
+
+```bash
+python cli/instryxc.py mycode.ix --emit wasm -o mywebapp
+```
+
+Output: `build/mywebapp.wasm`
+
+---
+
+## 12. 👁 AST Visualization
+
+Generates `.png` or `.svg` of your code’s structure.
+
+```bash
+--emit visual -o mycode_ast
+```
+
+Also available as `.json`:
+
+```bash
+--emit json -o mycode_ast.json
+```
+
+---
+
+## 13. ⚡ JIT Execution Mode
+
+```bash
+python cli/instryxc.py demo.ix --run
+```
+
+Uses LLVM MCJIT and `llvmlite.binding` for real-time native execution.
+
+---
+
+## 14. 🔍 Advanced Topics
+
+* `match` pattern matching
+* `enum`, `struct`, `tuple`
+* `namespace`, `import`, `module` (all supported!)
+* `class` (optional)
+* Threading + virtual fibers
+* Parallel memory zones
+
+---
+
+## 15. 🤖 CIAMS AI Engine: Smart Macro Assistant
+
+```python
+from ciams.instryx_ciams_ai_engine import CIAMSAIEngine
+
+ai = CIAMSAIEngine()
+ai.analyze_code(open("hello.ix").read(), developer_id="me")
+print(ai.suggest_macros("db error retry"))
+```
+
+---
+
+## 16. 🔌 Plugin System and Extensions
+
+Instryx supports:
+
+* Compiler plugins (e.g. IR pass injectors)
+* Macro expansion plugins
+* Dev tool extensions (syntax highlighters, graph builders)
+
+---
+
+## 17. 📁 Instryx Project Layout
+
+```bash
+project/
+ ┣ main.ix
+ ┣ module/
+ ┃ ┗ math.ix
+ ┣ output/
+ ┣ tests/
+ ┗ README.md
+```
+
+---
+
+## 18. 🧪 DevOps and Batch Compilation
+
+Use `instryxc` with shell or CI pipelines:
+
+```bash
+find . -name "*.ix" -exec python cli/instryxc.py {} --emit exe -o {}.out \;
+```
+
+---
+
+## 19. 🔐 Security, Signing, and Sandboxing
+
+* `quarantine` prevents crashes
+* CIAMS can hash and sign macro usage
+* Planned: cryptographic function sealing, sandbox modes
+
+---
+
+## 20. 🧪 Future Features and Experimental Modes
+
+| Feature                     | Status    |
+| --------------------------- | --------- |
+| Macro mutation AI           | 🔜 In dev |
+| Dodecagram thread optimizer | 🔜 In dev |
+| Binary AST sharding         | 🔜 In dev |
+| Syntax morph dialects       | 🔜 In dev |
+| LSP server                  | 🔜 In dev |
+| Browser REPL + Electron GUI | 🔜 In dev |
+
+---
+
+## ✅ You're Ready to Build
+
+Start with:
+
+```bash
+python cli/instryxc.py yourfile.ix --run
+```
+
+Then move to:
+
+```bash
+--emit exe
+--emit wasm
+--emit visual
+--emit json
+```
+
+Instryx is now ready for:
+
+* Real software
+* Embedded firmware
+* WebAssembly apps
+* Cross-platform CLI tools
+* AI-assisted macro scripting
+
+---
+
+
+
+
+---
+
+# 🧠 **Dodecagram AST Developer Training Module**
+
+**Language**: Instryx
+**Focus**: AST Development using the 12-branch Dodecagram Model
+**Audience**: Compiler engineers, tool developers, language theorists, and AST visual tool integrators
+**Last Updated**: 2025-09-16
+
+---
+
+## 📘 Table of Contents
+
+1. [Introduction to the Dodecagram](#1-introduction-to-the-dodecagram)
+2. [AST Core Structure](#2-ast-core-structure)
+3. [Branch Indexing & Meaning](#3-branch-indexing--meaning)
+4. [How to Build a Dodecagram AST](#4-how-to-build-a-dodecagram-ast)
+5. [Traversal Techniques](#5-traversal-techniques)
+6. [Code-to-AST Conversion Pipeline](#6-code-to-ast-conversion-pipeline)
+7. [Expanding AST with Plugins](#7-expanding-ast-with-plugins)
+8. [Visualizing the AST](#8-visualizing-the-ast)
+9. [Debugging the Dodecagram](#9-debugging-the-dodecagram)
+10. [Exporting AST as JSON, Graphviz, or HTML5 Tree](#10-exporting-ast-as-json-graphviz-or-html5-tree)
+11. [Using AST in Codegen and Interpretation](#11-using-ast-in-codegen-and-interpretation)
+12. [Advanced Branch Specialization](#12-advanced-branch-specialization)
+13. [Best Practices for AST Safety and Mutation](#13-best-practices-for-ast-safety-and-mutation)
+14. [CIAMS-Aided AST Repair](#14-ciams-aided-ast-repair)
+15. [Future Concepts: Quantum Dodecagrams & AST Folding](#15-future-concepts-quantum-dodecagrams--ast-folding)
+
+---
+
+## 1. 🌀 Introduction to the Dodecagram
+
+The **Dodecagram** is a 12-branch Abstract Syntax Tree node structure used in **Instryx**. Each node has a potential of **12 directional children**, assigned meaning based on index position (clock-style or hexagram-style orientation).
+
+**Why 12?**
+
+* Parallel-safe branch allocation
+* Ideal for folding, radial graph visualizations
+* Facilitates circular reference detection
+* Native fit for base-12 opcode systems (DGM)
+
+---
+
+## 2. 🌳 AST Core Structure
+
+Each node in the Instryx Dodecagram contains:
+
+```python
+class DodecagramNode:
+    def __init__(self, node_type, value=None):
+        self.node_type = node_type
+        self.value = value
+        self.branches = [None] * 12
+```
+
+You can think of it as:
+
+```text
+        [0]
+    [11]   [1]
+ [10]         [2]
+ [9]           [3]
+    [8]   [4]
+        [7]
+        [6]
+        [5]
+```
+
+---
+
+## 3. 🧭 Branch Indexing & Meaning
+
+| Index | Meaning/Typical Use                |
+| ----- | ---------------------------------- |
+| 0     | **Primary Operand** (e.g., LHS)    |
+| 1     | **Secondary Operand** (RHS)        |
+| 2     | **Target** (assignments, labels)   |
+| 3     | **Condition** (for `if`, loops)    |
+| 4     | **Then block**                     |
+| 5     | **Else block / fallback**          |
+| 6     | **Next instruction**               |
+| 7     | **Parent call / caller context**   |
+| 8     | **Macro-expansion result**         |
+| 9     | **Captured closure/lexical scope** |
+| 10    | **Metadata / CIAMS hint**          |
+| 11    | **Quarantine / failover path**     |
+
+> These are default meanings; branch usage is flexible per node type.
+
+---
+
+## 4. 🏗 How to Build a Dodecagram AST
+
+### From Code
+
+```python
+from instryx_parser import InstryxParser
+from instryx_ast import DodecagramBuilder
+
+code = """
+func greet() { print: "Hello World"; };
+main() { greet(); };
+"""
+
+tree = InstryxParser().parse(code)
+dodecagram_root = DodecagramBuilder().build(tree)
+```
+
+---
+
+## 5. 🔀 Traversal Techniques
+
+### Depth-First:
+
+```python
+def traverse_depth(node):
+    print(node.node_type, node.value)
+    for b in node.branches:
+        if b:
+            traverse_depth(b)
+```
+
+### Breadth-Radial:
+
+```python
+from collections import deque
+
+def radial_traversal(node):
+    queue = deque([node])
+    while queue:
+        current = queue.popleft()
+        print(current.node_type, current.value)
+        queue.extend([b for b in current.branches if b])
+```
+
+---
+
+## 6. 🛠 Code-to-AST Conversion Pipeline
+
+```text
+Source Code (.ix)
+   ↓
+Lexer (token stream)
+   ↓
+Parser (grammar trees)
+   ↓
+AST Nodes (instryx_ast.py)
+   ↓
+Dodecagram Builder (12-branch structure)
+   ↓
+→ Interpreter
+→ LLVM IR Generator
+→ Visualizer / Exporter
+```
+
+---
+
+## 7. 🧩 Expanding AST with Plugins
+
+Use the `instryx_ast.plugins` folder to add:
+
+* **Branch mutators**
+* **CIAMS annotations**
+* **Sanity checkers**
+* **Auto-doc generators**
+
+Example:
+
+```python
+def plugin_tag_all_prints(ast):
+    if ast.node_type == "print":
+        ast.branches[10] = DodecagramNode("meta", "📢 loud")
+```
+
+---
+
+## 8. 🖼 Visualizing the AST
+
+```bash
+python instryx_visualizer.py file.ix --emit graphviz -o ast.png
+```
+
+Options:
+
+* PNG
+* SVG
+* DOT
+* JSON
+
+Graph libraries:
+
+* `graphviz` (default)
+* `pyvis`
+* `asciitree` (fallback for CLI)
+
+---
+
+## 9. 🐞 Debugging the Dodecagram
+
+```bash
+python cli/instryxc.py file.ix --emit debug-ast
+```
+
+Emits:
+
+* Branch occupancy report
+* Node consistency validator
+* Orphan node tracebacks
+* Null-pointer safe zones
+
+---
+
+## 10. 📤 Exporting AST as JSON, Graphviz, or HTML5 Tree
+
+```bash
+--emit json
+--emit htmltree
+--emit svg
+--emit dot
+```
+
+Ideal for:
+
+* LSP integrations
+* Web IDEs
+* Teaching tools
+
+---
+
+## 11. 🔄 Using AST in Codegen and Interpretation
+
+LLVM IR generator walks the Dodecagram:
+
+```python
+def emit_ir(node):
+    if node.node_type == "add":
+        lhs = emit_ir(node.branches[0])
+        rhs = emit_ir(node.branches[1])
+        return ir_builder.add(lhs, rhs)
+```
+
+Interpreter does same — just with a stack-based executor.
+
+---
+
+## 12. 🧬 Advanced Branch Specialization
+
+You can override the meaning of branches for:
+
+* Macros
+* AI-assistance
+* Language dialects
+
+Example: Branch 10 becomes "hologram metadata" in sci-fi dialect.
+
+---
+
+## 13. 🧹 Best Practices for AST Safety and Mutation
+
+* Use quarantine-safe edits
+* Never delete node values mid-branch cascade
+* Avoid double-parenting in node reuse
+* Reassign nodes via `.copy()` to preserve history
+
+---
+
+## 14. 🧠 CIAMS-Aided AST Repair
+
+The AI engine can correct ASTs:
+
+```python
+from instryx_ciams_ai_engine import CIAMSAIEngine
+
+ciams = CIAMSAIEngine()
+fixed_ast = ciams.repair_ast(ast)
+```
+
+Uses LLM + heuristics for branch missing, wrong types, semantic misfit.
+
+---
+
+## 15. 🧪 Future Concepts: Quantum Dodecagrams & AST Folding
+
+Experimental branches may allow:
+
+* **Quantum branching**: multiple simultaneous values (for parallel guess/execution)
+* **Node folding**: merging repeating branches for performance
+* **Timefolded AST**: timeline-sliced AST mutation states for undo/replay
+
+---
+
+## 🧠 Summary
+
+| Skill Learned                 | Use Case                            |
+| ----------------------------- | ----------------------------------- |
+| Build 12-branch AST           | Code understanding & interpretation |
+| Traverse and visualize AST    | Debugging, optimization             |
+| Modify and tag AST branches   | Add macros, metadata, AI tags       |
+| Export AST                    | To JSON, SVG, or dev tools          |
+| Use in Codegen or Interpreter | For running or compiling code       |
+
+---
+
+
