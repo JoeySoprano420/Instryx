@@ -22,6 +22,7 @@ import ast
 from dataclasses import dataclass
 from typing import List, Tuple, Iterator, Optional, Union, Iterable, Dict
 from functools import lru_cache
+from abc import ABC, abstractmethod
 
 # Public token shapes
 TokenSimple = Tuple[str, str]
@@ -730,6 +731,407 @@ class InstryxParser:
             'errors': len(self._errors),
             'tokens_consumed': self.pos
         }
+
+
+# ============================================================================
+# Advanced AST Optimization Pipeline
+# ============================================================================
+
+class OptimizationPass(ABC):
+    """Abstract base class for AST optimization passes."""
+    
+    @abstractmethod
+    def run(self, ast: ASTNode) -> ASTNode:
+        """Apply optimization pass to AST."""
+        pass
+    
+    @property
+    @abstractmethod
+    def name(self) -> str:
+        """Name of the optimization pass."""
+        pass
+
+
+class ConstantFoldingPass(OptimizationPass):
+    """Advanced constant folding optimization pass."""
+    
+    def __init__(self):
+        self.stats = {'constants_folded': 0, 'expressions_simplified': 0}
+    
+    @property
+    def name(self) -> str:
+        return "constant_folding"
+    
+    def run(self, ast: ASTNode) -> ASTNode:
+        """Apply constant folding optimization."""
+        return self._fold_constants(ast)
+    
+    def _fold_constants(self, node: ASTNode) -> ASTNode:
+        """Recursively fold constants in AST."""
+        if not node.children:
+            return node
+        
+        # First, recursively optimize children
+        optimized_children = [self._fold_constants(child) for child in node.children]
+        
+        # Create new node with optimized children
+        new_node = ASTNode(node.node_type, node.value, optimized_children)
+        
+        # Apply constant folding to binary operations
+        if node.node_type == 'BinOp' and len(optimized_children) == 2:
+            left, right = optimized_children
+            folded = self._try_fold_binop(node.value, left, right)
+            if folded:
+                self.stats['constants_folded'] += 1
+                return folded
+        
+        # Apply constant folding to unary operations
+        elif node.node_type == 'UnaryOp' and len(optimized_children) == 1:
+            operand = optimized_children[0]
+            folded = self._try_fold_unary(node.value, operand)
+            if folded:
+                self.stats['constants_folded'] += 1
+                return folded
+        
+        # Simplify boolean expressions
+        elif node.node_type == 'BinOp' and node.value in ('and', 'or'):
+            simplified = self._simplify_boolean(node.value, optimized_children[0], optimized_children[1])
+            if simplified:
+                self.stats['expressions_simplified'] += 1
+                return simplified
+        
+        return new_node
+    
+    def _try_fold_binop(self, op: str, left: ASTNode, right: ASTNode) -> Optional[ASTNode]:
+        """Try to fold binary operation if both operands are constants."""
+        if left.node_type != 'Number' or right.node_type != 'Number':
+            return None
+        
+        try:
+            lv, rv = left.value, right.value
+            
+            # Ensure numeric types
+            if isinstance(lv, str):
+                lv = float(lv) if '.' in lv else int(lv)
+            if isinstance(rv, str):
+                rv = float(rv) if '.' in rv else int(rv)
+            
+            if op == '+':
+                result = lv + rv
+            elif op == '-':
+                result = lv - rv
+            elif op == '*':
+                result = lv * rv
+            elif op == '/':
+                if rv == 0:
+                    return None  # Don't fold division by zero
+                result = lv / rv
+            elif op == '%':
+                if rv == 0:
+                    return None  # Don't fold modulo by zero
+                result = lv % rv
+            elif op == '**':
+                result = lv ** rv
+            elif op == '==':
+                result = lv == rv
+            elif op == '!=':
+                result = lv != rv
+            elif op == '<':
+                result = lv < rv
+            elif op == '>':
+                result = lv > rv
+            elif op == '<=':
+                result = lv <= rv
+            elif op == '>=':
+                result = lv >= rv
+            else:
+                return None
+            
+            # Normalize result
+            if isinstance(result, bool):
+                result = 1 if result else 0
+            elif isinstance(result, float) and result.is_integer():
+                result = int(result)
+            
+            return ASTNode('Number', result)
+            
+        except (ValueError, TypeError, OverflowError):
+            return None
+    
+    def _try_fold_unary(self, op: str, operand: ASTNode) -> Optional[ASTNode]:
+        """Try to fold unary operation if operand is constant."""
+        if operand.node_type != 'Number':
+            return None
+        
+        try:
+            val = operand.value
+            if isinstance(val, str):
+                val = float(val) if '.' in val else int(val)
+            
+            if op == '-':
+                result = -val
+            elif op == '+':
+                result = val
+            elif op in ('not', '!'):
+                result = 1 if not val else 0
+            else:
+                return None
+            
+            return ASTNode('Number', result)
+            
+        except (ValueError, TypeError):
+            return None
+    
+    def _simplify_boolean(self, op: str, left: ASTNode, right: ASTNode) -> Optional[ASTNode]:
+        """Simplify boolean expressions with known constants."""
+        # Short-circuit evaluation patterns
+        if op == 'and':
+            # false and X -> false
+            if left.node_type == 'Number' and not left.value:
+                return ASTNode('Number', 0)
+            # X and false -> false  
+            if right.node_type == 'Number' and not right.value:
+                return ASTNode('Number', 0)
+            # true and X -> X
+            if left.node_type == 'Number' and left.value:
+                return right
+            # X and true -> X
+            if right.node_type == 'Number' and right.value:
+                return left
+        
+        elif op == 'or':
+            # true or X -> true
+            if left.node_type == 'Number' and left.value:
+                return ASTNode('Number', 1)
+            # X or true -> true
+            if right.node_type == 'Number' and right.value:
+                return ASTNode('Number', 1)  
+            # false or X -> X
+            if left.node_type == 'Number' and not left.value:
+                return right
+            # X or false -> X
+            if right.node_type == 'Number' and not right.value:
+                return left
+        
+        return None
+
+
+class DeadCodeEliminationPass(OptimizationPass):
+    """Dead code elimination optimization pass."""
+    
+    def __init__(self):
+        self.stats = {'dead_statements_removed': 0, 'unreachable_code_removed': 0}
+    
+    @property
+    def name(self) -> str:
+        return "dead_code_elimination"
+    
+    def run(self, ast: ASTNode) -> ASTNode:
+        """Apply dead code elimination."""
+        return self._eliminate_dead_code(ast)
+    
+    def _eliminate_dead_code(self, node: ASTNode) -> ASTNode:
+        """Remove dead code from AST."""
+        if not node.children:
+            return node
+        
+        if node.node_type == 'Block':
+            return self._optimize_block(node)
+        elif node.node_type == 'If':
+            return self._optimize_if(node)
+        else:
+            # Recursively process children
+            optimized_children = [self._eliminate_dead_code(child) for child in node.children]
+            return ASTNode(node.node_type, node.value, optimized_children)
+    
+    def _optimize_block(self, block: ASTNode) -> ASTNode:
+        """Optimize block by removing unreachable code after returns."""
+        new_statements = []
+        found_return = False
+        
+        for stmt in block.children:
+            if found_return:
+                self.stats['unreachable_code_removed'] += 1
+                continue
+            
+            optimized_stmt = self._eliminate_dead_code(stmt)
+            new_statements.append(optimized_stmt)
+            
+            if stmt.node_type == 'Return':
+                found_return = True
+        
+        return ASTNode(block.node_type, block.value, new_statements)
+    
+    def _optimize_if(self, if_node: ASTNode) -> ASTNode:
+        """Optimize if statements with constant conditions."""
+        if len(if_node.children) < 2:
+            return if_node
+        
+        condition = if_node.children[0]
+        then_branch = if_node.children[1]
+        else_branch = if_node.children[2] if len(if_node.children) > 2 else None
+        
+        # If condition is constant, eliminate one branch
+        if condition.node_type == 'Number':
+            if condition.value:
+                # Condition is true, keep only then branch
+                self.stats['dead_statements_removed'] += 1
+                return self._eliminate_dead_code(then_branch)
+            else:
+                # Condition is false, keep only else branch (or eliminate entirely)
+                self.stats['dead_statements_removed'] += 1
+                if else_branch:
+                    return self._eliminate_dead_code(else_branch)
+                else:
+                    return ASTNode('Block', children=[])  # Empty block
+        
+        # Otherwise, recursively optimize branches
+        optimized_condition = self._eliminate_dead_code(condition)
+        optimized_then = self._eliminate_dead_code(then_branch)
+        optimized_else = self._eliminate_dead_code(else_branch) if else_branch else None
+        
+        children = [optimized_condition, optimized_then]
+        if optimized_else:
+            children.append(optimized_else)
+        
+        return ASTNode(if_node.node_type, if_node.value, children)
+
+
+class InliningPass(OptimizationPass):
+    """Simple function inlining optimization pass."""
+    
+    def __init__(self, max_inline_size: int = 10):
+        self.max_inline_size = max_inline_size
+        self.functions = {}
+        self.stats = {'functions_inlined': 0, 'calls_replaced': 0}
+    
+    @property
+    def name(self) -> str:
+        return "function_inlining"
+    
+    def run(self, ast: ASTNode) -> ASTNode:
+        """Apply function inlining optimization."""
+        # First pass: collect small functions
+        self._collect_functions(ast)
+        
+        # Second pass: inline function calls
+        return self._inline_calls(ast)
+    
+    def _collect_functions(self, node: ASTNode):
+        """Collect functions that are candidates for inlining."""
+        if node.node_type == 'Function':
+            func_name = node.value
+            if len(node.children) >= 2:
+                params = node.children[0]
+                body = node.children[1]
+                
+                # Only inline small functions with simple bodies
+                if (self._count_statements(body) <= self.max_inline_size and
+                    len(params.children) <= 3):  # Max 3 parameters
+                    self.functions[func_name] = node
+        
+        for child in node.children:
+            self._collect_functions(child)
+    
+    def _count_statements(self, node: ASTNode) -> int:
+        """Count statements in a node (approximate complexity)."""
+        if node.node_type in ('Block', 'Program'):
+            return sum(self._count_statements(child) for child in node.children)
+        else:
+            return 1 + sum(self._count_statements(child) for child in node.children)
+    
+    def _inline_calls(self, node: ASTNode) -> ASTNode:
+        """Inline function calls where beneficial."""
+        if node.node_type == 'Call' and node.value in self.functions:
+            func_def = self.functions[node.value]
+            self.stats['calls_replaced'] += 1
+            # For now, just mark it as inlined (full implementation would substitute parameters)
+            return ASTNode('InlinedCall', node.value, node.children)
+        
+        # Recursively process children
+        optimized_children = [self._inline_calls(child) for child in node.children]
+        return ASTNode(node.node_type, node.value, optimized_children)
+
+
+class OptimizationPipeline:
+    """Orchestrates multiple optimization passes for maximum performance."""
+    
+    def __init__(self):
+        self.passes = [
+            ConstantFoldingPass(),
+            DeadCodeEliminationPass(),
+            InliningPass(),
+        ]
+        self.stats = {'passes_run': 0, 'total_optimizations': 0}
+    
+    def optimize(self, ast: ASTNode, iterations: int = 3) -> ASTNode:
+        """Run optimization passes until convergence or max iterations."""
+        current_ast = ast
+        
+        for iteration in range(iterations):
+            changed = False
+            iteration_stats = {}
+            
+            for pass_instance in self.passes:
+                old_ast_str = str(current_ast)  # Simple change detection
+                
+                optimized_ast = pass_instance.run(current_ast)
+                
+                new_ast_str = str(optimized_ast)
+                if old_ast_str != new_ast_str:
+                    changed = True
+                    current_ast = optimized_ast
+                
+                iteration_stats[pass_instance.name] = pass_instance.stats.copy()
+                self.stats['passes_run'] += 1
+            
+            # Early termination if no changes
+            if not changed:
+                break
+            
+            # Update total optimization count
+            for pass_stats in iteration_stats.values():
+                for key, value in pass_stats.items():
+                    if isinstance(value, int):
+                        self.stats['total_optimizations'] += value
+        
+        return current_ast
+    
+    def get_stats(self) -> dict:
+        """Get comprehensive optimization statistics."""
+        return {
+            **self.stats,
+            'passes': {pass_instance.name: pass_instance.stats 
+                      for pass_instance in self.passes}
+        }
+
+
+# Enhanced parser with integrated optimization
+class OptimizedInstryxParser(InstryxParser):
+    """Parser with integrated optimization pipeline."""
+    
+    def __init__(self, enable_optimization: bool = True):
+        super().__init__()
+        self.enable_optimization = enable_optimization
+        self.optimizer = OptimizationPipeline() if enable_optimization else None
+    
+    def parse(self, code: str, optimize: bool = None) -> ASTNode:
+        """Parse code with optional optimization."""
+        ast = super().parse(code)
+        
+        should_optimize = optimize if optimize is not None else self.enable_optimization
+        
+        if should_optimize and self.optimizer:
+            optimized_ast = self.optimizer.optimize(ast)
+            
+            # Add optimization stats to parser stats
+            if hasattr(self, '_stats'):
+                opt_stats = self.optimizer.get_stats()
+                self._stats.update({f"opt_{k}": v for k, v in opt_stats.items()})
+            
+            return optimized_ast
+        
+        return ast
 
 
 # Test block (can be removed in production)
