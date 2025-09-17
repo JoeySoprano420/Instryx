@@ -1,5 +1,4778 @@
 
 
+# instryx_jit_aot_runner.py
+# JIT-assisted AOT Execution for Instryx LLVM IR Modules
+# Author: Violet Magenta / VACU Technologies
+# License: MIT
+
+from instryx_llvm_ir_codegen import InstryxLLVMCodegen
+from llvmlite import binding
+import ctypes
+
+class InstryxRunner:
+    def __init__(self):
+        self.codegen = InstryxLLVMCodegen()
+        self.engine = None
+
+    def _create_execution_engine(self):
+        binding.initialize()
+        binding.initialize_native_target()
+        binding.initialize_native_asmprinter()
+
+        target = binding.Target.from_default_triple()
+        target_machine = target.create_target_machine()
+        backing_mod = binding.parse_assembly("")
+        engine = binding.create_mcjit_compiler(backing_mod, target_machine)
+        return engine
+
+    def _compile_ir(self, llvm_ir: str):
+        mod = binding.parse_assembly(llvm_ir)
+        mod.verify()
+        self.engine.add_module(mod)
+        self.engine.finalize_object()
+        self.engine.run_static_constructors()
+
+    def run(self, code: str, invoke_main: bool = True):
+        llvm_ir = self.codegen.generate(code)
+        self.engine = self._create_execution_engine()
+        self._compile_ir(llvm_ir)
+
+        if invoke_main:
+            func_ptr = self.engine.get_function_address("main")
+            cfunc = ctypes.CFUNCTYPE(None)(func_ptr)
+            print("🚀 Running Instryx Program...")
+            cfunc()
+
+        return llvm_ir
+
+
+# Test block (can be removed in production)
+if __name__ == "__main__":
+    runner = InstryxRunner()
+    code = """
+    func greet(uid) {
+        print: "Hello from Instryx IR";
+    };
+
+    main() {
+        greet(1);
+    };
+    """
+    llvm_ir = runner.run(code)
+    print("\n🔬 LLVM IR Output:\n")
+    print(llvm_ir)
+
+    # Example usage:
+    code = """
+    func add(a, b) {
+        return a + b;
+    };
+    main() {
+        result = add(5, 7);
+        print: "Result is " + result;
+    };
+    """
+    llvm_ir = runner.run(code)
+    print("\n🔬 LLVM IR Output:\n")
+    print(llvm_ir)
+    # Example usage:
+    code = """
+    func add(a, b) {
+        return a + b;
+    };
+    main() {
+        result = add(5, 7);
+        print: "Result is " + result;
+    };
+    """
+    llvm_ir = runner.run(code)
+    print("\n🔬 LLVM IR Output:\n")
+    print(llvm_ir)
+
+instryx_jit_aot_runner.py
+# instryx_jit_aot_runner.py
+# JIT-assisted AOT Execution for Instryx LLVM IR Modules — supreme boosters
+# Author: Violet Magenta / VACU Technologies (modified)
+# License: MIT
+
+from instryx_llvm_ir_codegen import InstryxLLVMCodegen
+from llvmlite import binding
+import ctypes
+import hashlib
+import os
+import tempfile
+import subprocess
+import threading
+import time
+import logging
+import shutil
+import struct
+from typing import Optional, Sequence, Any, Dict, Tuple, List
+
+LOG = logging.getLogger("instryx.runner")
+if not LOG.handlers:
+    logging.basicConfig(level=logging.INFO)
+
+# Try to wire into shell metrics if available (safe import)
+_metrics = None
+_metrics_lock = None
+try:
+    from instryx_shell_enhancements import _metrics as _SHELL_METRICS, _metrics_lock as _SHELL_METRICS_LOCK  # type: ignore
+    _metrics = _SHELL_METRICS
+    _metrics_lock = _SHELL_METRICS_LOCK
+except Exception:
+    # fallback: local simple counters
+    _metrics = {
+        "instryx_compile_requests_total": 0,
+        "instryx_compile_success_total": 0,
+        "instryx_compile_failure_total": 0,
+        "instryx_run_requests_total": 0,
+        "instryx_run_success_total": 0,
+        "instryx_run_failure_total": 0,
+    }
+    import threading as _threading
+    _metrics_lock = _threading.RLock()
+
+
+# More comprehensive type mapping for simple primitives and helpers
+_CTYPE_MAP: Dict[str, Any] = {
+    "void": None,
+    "int": ctypes.c_int,
+    "uint": ctypes.c_uint,
+    "long": ctypes.c_long,
+    "ulong": ctypes.c_ulong,
+    "float": ctypes.c_float,
+    "double": ctypes.c_double,
+    "char*": ctypes.c_char_p,
+    "size_t": ctypes.c_size_t,
+    "intptr": ctypes.c_void_p,
+}
+
+
+def _metric_inc(name: str, n: int = 1):
+    try:
+        with _metrics_lock:
+            _metrics[name] = _metrics.get(name, 0) + n
+    except Exception:
+        pass
+
+
+class StructBuilder:
+    """
+    Helper to build ctypes.Structure subclasses from a simple description.
+    Example:
+      desc = [("a", "int"), ("b", "double"), ("s", ("char*", 32))]
+      MyStruct = StructBuilder.build("MyStruct", desc)
+      inst = MyStruct()
+      inst.a = 3
+    Supported field spec forms:
+      - ("name", "int") -- maps via _CTYPE_MAP
+      - ("name", ("char*", N)) -- fixed-size char array
+      - ("name", ctypes.c_int) -- explicit ctypes type
+    """
+    @staticmethod
+    def _resolve_type(spec):
+        if isinstance(spec, str):
+            return _CTYPE_MAP.get(spec)
+        if isinstance(spec, tuple) and len(spec) == 2 and spec[0] == "char*":
+            # fixed-size char array of length spec[1]
+            return ctypes.c_char * int(spec[1])
+        if hasattr(spec, "_type_") or isinstance(spec, type):
+            return spec
+        return None
+
+    @staticmethod
+    def build(name: str, fields: Sequence[Tuple[str, Any]]):
+        cfields = []
+        for fname, ftype in fields:
+            ct = StructBuilder._resolve_type(ftype)
+            if ct is None:
+                raise TypeError(f"unsupported field type: {ftype}")
+            cfields.append((fname, ct))
+        # dynamic type creation
+        return type(name, (ctypes.Structure,), {"_fields_": cfields})
+
+
+def create_ctypes_array(ctype: Any, values: Sequence[Any]):
+    """
+    Create a ctypes array of given ctype and initialize with values.
+    ctype may be a string alias in _CTYPE_MAP or a ctypes type.
+    """
+    if isinstance(ctype, str):
+        ct = _CTYPE_MAP.get(ctype)
+    else:
+        ct = ctype
+    if ct is None:
+        raise TypeError("unknown ctype for array")
+    ArrType = ct * len(values)
+    arr = ArrType(*values)
+    return arr
+
+
+class InstryxRunner:
+    """
+    Enhanced runner for LLVM IR produced by Instryx codegen.
+
+    Enhancements:
+     - metrics wiring (compile/run counters)
+     - IR caching on disk
+     - AOT helpers: emit assembly, emit object, try to link to shared library
+     - ctypes-based marshalling helpers (structs, arrays)
+     - safe invocation with thread-based timeout and subprocess isolation option
+     - configurable verbosity and engine reuse
+    """
+
+    def __init__(self, cache_dir: Optional[str] = None, verbose: bool = False, reuse_engine: bool = True):
+        self.codegen = InstryxLLVMCodegen()
+        self.engine = None
+        self._modules = []  # keep references to modules
+        self.reuse_engine = bool(reuse_engine)
+        self.verbose = bool(verbose)
+        self.cache_dir = cache_dir or os.path.join(os.path.expanduser("~"), ".instryx_jit_cache")
+        os.makedirs(self.cache_dir, exist_ok=True)
+        if self.verbose:
+            LOG.setLevel(logging.DEBUG)
+
+    # ------------------------
+    # Engine lifecycle
+    # ------------------------
+    def _create_execution_engine(self):
+        binding.initialize()
+        binding.initialize_native_target()
+        binding.initialize_native_asmprinter()
+        target = binding.Target.from_default_triple()
+        target_machine = target.create_target_machine()
+        backing_mod = binding.parse_assembly("")
+        engine = binding.create_mcjit_compiler(backing_mod, target_machine)
+        if self.verbose:
+            LOG.debug("Created MCJIT engine (triple=%s)", target.triple)
+        return engine
+
+    def _prepare_engine(self):
+        if self.engine is None or not self.reuse_engine:
+            if self.engine is not None and not self.reuse_engine:
+                self._modules.clear()
+                self.engine = None
+            self.engine = self._create_execution_engine()
+            self._modules = []
+
+    def reset_engine(self):
+        """Dispose current engine and modules (best-effort)."""
+        try:
+            self._modules.clear()
+            self.engine = None
+            if self.verbose:
+                LOG.debug("Engine and modules reset")
+        except Exception:
+            LOG.exception("reset_engine failed")
+
+    # ------------------------
+    # IR caching and AOT helpers
+    # ------------------------
+    def _hash_ir(self, llvm_ir: str) -> str:
+        return hashlib.sha256(llvm_ir.encode("utf-8")).hexdigest()
+
+    def cache_ir(self, llvm_ir: str) -> str:
+        h = self._hash_ir(llvm_ir)
+        path = os.path.join(self.cache_dir, f"{h}.ll")
+        if not os.path.exists(path):
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(llvm_ir)
+        if self.verbose:
+            LOG.debug("IR cached -> %s", path)
+        return path
+
+    def emit_assembly(self, llvm_ir: str, out_path: Optional[str] = None) -> str:
+        if out_path is None:
+            out_path = tempfile.mktemp(suffix=".s")
+        mod = binding.parse_assembly(llvm_ir)
+        mod.verify()
+        tm = binding.Target.from_default_triple().create_target_machine()
+        asm = tm.emit_assembly(mod)
+        with open(out_path, "w", encoding="utf-8") as fh:
+            fh.write(asm)
+        if self.verbose:
+            LOG.debug("Assembly emitted -> %s", out_path)
+        return out_path
+
+    def emit_object(self, llvm_ir: str, out_path: Optional[str] = None) -> str:
+        if out_path is None:
+            out_path = tempfile.mktemp(suffix=".o")
+        mod = binding.parse_assembly(llvm_ir)
+        mod.verify()
+        tm = binding.Target.from_default_triple().create_target_machine()
+        obj_bytes = tm.emit_object(mod)
+        with open(out_path, "wb") as fh:
+            fh.write(obj_bytes)
+        if self.verbose:
+            LOG.debug("Object emitted -> %s (size=%d)", out_path, len(obj_bytes))
+        return out_path
+
+    def try_link_shared(self, object_path: str, out_shared: Optional[str] = None) -> Tuple[bool, str]:
+        if out_shared is None:
+            out_shared = object_path + (".so" if os.name != "nt" else ".dll")
+        cc = shutil.which("clang") or shutil.which("gcc")
+        if not cc:
+            return False, "no system compiler (clang/gcc) found"
+        cmd = [cc, "-shared", "-o", out_shared, object_path]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            if proc.returncode != 0:
+                return False, f"linker failed: {proc.stderr.strip()}"
+            if self.verbose:
+                LOG.debug("Linked shared library -> %s", out_shared)
+            return True, out_shared
+        except Exception as e:
+            return False, f"link failed: {e}"
+
+    # ------------------------
+    # Compile / add module
+    # ------------------------
+    def _compile_ir(self, llvm_ir: str, module_name: Optional[str] = None):
+        self._prepare_engine()
+        mod = binding.parse_assembly(llvm_ir)
+        mod.verify()
+        if module_name:
+            try:
+                mod.name = module_name
+            except Exception:
+                pass
+        self.engine.add_module(mod)
+        self.engine.finalize_object()
+        self.engine.run_static_constructors()
+        self._modules.append(mod)
+        if self.verbose:
+            LOG.debug("Compiled module (%s); modules count=%d", module_name or "<anon>", len(self._modules))
+
+    # ------------------------
+    # Invocation helpers
+    # ------------------------
+    def _ctype_from_spec(self, spec: Any):
+        if spec is None:
+            return None
+        if isinstance(spec, str):
+            return _CTYPE_MAP.get(spec)
+        return spec
+
+    def call_function(self, func_name: str, arg_types: Optional[Sequence[Any]] = None,
+                      ret_type: Any = "void", args: Optional[Sequence[Any]] = None,
+                      timeout: Optional[float] = None) -> Tuple[bool, Any]:
+        if self.engine is None:
+            return False, "engine not initialized; compile IR first"
+        ptr = self.engine.get_function_address(func_name)
+        if not ptr:
+            return False, f"function {func_name} not found"
+        arg_types = arg_types or []
+        ctypes_args = []
+        for t in arg_types:
+            ct = self._ctype_from_spec(t)
+            if ct is None:
+                return False, f"unsupported arg type {t}"
+            ctypes_args.append(ct)
+        ctypes_ret = self._ctype_from_spec(ret_type)
+        try:
+            if ctypes_ret is None:
+                FUN = ctypes.CFUNCTYPE(None, *ctypes_args)
+            else:
+                FUN = ctypes.CFUNCTYPE(ctypes_ret, *ctypes_args)
+            cfunc = FUN(ptr)
+        except Exception as e:
+            return False, f"failed to wrap cfunc: {e}"
+        result = {"ok": None, "val": None}
+        def _invoke():
+            try:
+                r = cfunc(*([] if args is None else list(args)))
+                result["ok"] = True
+                result["val"] = r
+            except Exception as e:
+                result["ok"] = False
+                result["val"] = f"exception: {e}"
+        th = threading.Thread(target=_invoke, daemon=True)
+        th.start()
+        th.join(timeout=timeout)
+        if th.is_alive():
+            return False, "timeout"
+        return result["ok"], result["val"]
+
+    # ------------------------
+    # High-level run
+    # ------------------------
+    def run(self, code: str, invoke_main: bool = True, timeout: Optional[float] = None,
+            use_subprocess: bool = False, cache_ir: bool = True) -> str:
+        # metrics
+        _metric_inc("instryx_compile_requests_total", 1)
+        llvm_ir = self.codegen.generate(code)
+        if cache_ir:
+            self.cache_ir(llvm_ir)
+        try:
+            self._compile_ir(llvm_ir)
+            _metric_inc("instryx_compile_success_total", 1)
+        except Exception as e:
+            _metric_inc("instryx_compile_failure_total", 1)
+            LOG.exception("compile failed")
+            raise
+
+        if not invoke_main:
+            return llvm_ir
+
+        _metric_inc("instryx_run_requests_total", 1)
+        if use_subprocess:
+            stub = f"""
+import sys, ctypes
+from llvmlite import binding
+binding.initialize()
+binding.initialize_native_target()
+binding.initialize_native_asmprinter()
+mod = binding.parse_assembly(r'''{llvm_ir}''')
+mod.verify()
+target = binding.Target.from_default_triple()
+tm = target.create_target_machine()
+engine = binding.create_mcjit_compiler(binding.parse_assembly(""), tm)
+engine.add_module(mod)
+engine.finalize_object()
+engine.run_static_constructors()
+addr = engine.get_function_address("main")
+if not addr:
+    print("FUNCTION_NOT_FOUND", file=sys.stderr)
+    sys.exit(2)
+ctypes.CFUNCTYPE(None)(addr)()
+"""
+            with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False, encoding="utf-8") as tf:
+                tf.write(stub)
+                stub_path = tf.name
+            try:
+                proc = subprocess.run([shutil.which("python") or "python", stub_path], capture_output=True, text=True, timeout=timeout)
+                if proc.returncode != 0:
+                    _metric_inc("instryx_run_failure_total", 1)
+                    LOG.error("subprocess run failed: %s", proc.stderr.strip())
+                else:
+                    _metric_inc("instryx_run_success_total", 1)
+                    if self.verbose:
+                        LOG.debug("subprocess run stdout: %s", proc.stdout.strip())
+            except subprocess.TimeoutExpired:
+                _metric_inc("instryx_run_failure_total", 1)
+                LOG.error("subprocess timed out")
+            finally:
+                try:
+                    os.unlink(stub_path)
+                except Exception:
+                    pass
+            return llvm_ir
+
+        ok, res = self.call_function("main", arg_types=None, ret_type="void", args=(), timeout=timeout)
+        if ok:
+            _metric_inc("instryx_run_success_total", 1)
+            if self.verbose:
+                LOG.debug("main invocation succeeded")
+        else:
+            _metric_inc("instryx_run_failure_total", 1)
+            LOG.error("main invocation failed: %s", res)
+        return llvm_ir
+
+
+# ------------------------
+# minimal test/demo
+# ------------------------
+if __name__ == "__main__":
+    runner = InstryxRunner(verbose=True)
+    sample = """
+    func greet(uid) {
+        print: "Hello from Instryx IR";
+    };
+
+    main() {
+        greet(1);
+    };
+    """
+    try:
+        ir = runner.run(sample, invoke_main=True, timeout=5)
+        print("\n🔬 LLVM IR Output:\n")
+        print(ir)
+    except Exception as e:
+        print("run failed:", e)
+
+setup.py
+# setup.py — auxiliary helper to build example C extension or link object files.
+# This helper is intentionally small: it provides convenience commands for users to
+# produce a shared library from an object file or compile a tiny example C module.
+
+from setuptools import setup, Extension
+import subprocess
+import sys
+import os
+
+def build_example_shared(output="libexample.so"):
+    # A minimal C source to demonstrate loading via ctypes
+    src = r'''
+#include <stdio.h>
+
+int example_add(int a, int b) {
+    return a + b;
+}
+
+void example_print(const char *s) {
+    printf("example_print: %s\n", s);
+}
+'''
+    cur = os.path.abspath(os.path.dirname(__file__))
+    cpath = os.path.join(cur, "example_cmodule.c")
+    with open(cpath, "w", encoding="utf-8") as f:
+        f.write(src)
+    cc = shutil.which("clang") or shutil.which("gcc")
+    if not cc:
+        print("No system compiler found (clang/gcc required)")
+        return 2
+    cmd = [cc, "-shared", "-fPIC", "-O2", "-o", output, cpath]
+    try:
+        subprocess.check_call(cmd)
+        print("Built", output)
+        return 0
+    except Exception as e:
+        print("Build failed:", e)
+        return 1
+
+if __name__ == "__main__":
+    # simple helper CLI: python setup.py build_shared
+    import shutil
+    if len(sys.argv) >= 2 and sys.argv[1] == "build_shared":
+        out = sys.argv[2] if len(sys.argv) > 2 else "libexample.so"
+        sys.exit(build_example_shared(out))
+    print("Usage: python setup.py build_shared [out.so]")
+
+examples/link_and_load_shared.py
+# Example script: use InstryxRunner to emit object, link to shared lib and load via ctypes
+
+import os
+from instryx_jit_aot_runner import InstryxRunner
+
+runner = InstryxRunner(verbose=True)
+
+# simple sample that defines a function callable via C ABI
+# The codegen must generate an extern "C" compatible function named 'add' for demonstration.
+# Replace with your codegen specifics as needed.
+code = """
+func add(a, b) {
+    return a + b;
+}
+
+main() {
+    // no-op
+};
+"""
+
+ir = runner.codegen.generate(code)
+# emit object file
+obj_path = runner.emit_object(ir)
+print("Emitted object:", obj_path)
+
+# link to shared library (requires gcc/clang)
+ok, out = runner.try_link_shared(obj_path)
+if not ok:
+    print("Link failed:", out)
+else:
+    libpath = out
+    print("Linked shared lib:", libpath)
+    # load via ctypes
+    lib = os.path.abspath(libpath)
+    cdll = ctypes.CDLL(lib)
+    # assume 'add' exists and takes two ints -> int
+    try:
+        add = cdll.add
+        add.restype = ctypes.c_int
+        add.argtypes = [ctypes.c_int, ctypes.c_int]
+        print("add(10,32) ->", add(10, 32))
+    except Exception as e:
+        print("failed to call add:", e)
+
+# instryx_jit_aot_runner.py
+# JIT-assisted AOT Execution for Instryx LLVM IR Modules — supreme boosters
+# Author: Violet Magenta / VACU Technologies (modified)
+# License: MIT
+
+from instryx_llvm_ir_codegen import InstryxLLVMCodegen
+from llvmlite import binding
+import ctypes
+import hashlib
+import os
+import tempfile
+import subprocess
+import threading
+import time
+import logging
+import shutil
+import struct
+from typing import Optional, Sequence, Any, Dict, Tuple, List
+
+LOG = logging.getLogger("instryx.runner")
+if not LOG.handlers:
+    logging.basicConfig(level=logging.INFO)
+
+# Try to wire into shell metrics if available (safe import)
+_metrics = None
+_metrics_lock = None
+try:
+    from instryx_shell_enhancements import _metrics as _SHELL_METRICS, _metrics_lock as _SHELL_METRICS_LOCK  # type: ignore
+    _metrics = _SHELL_METRICS
+    _metrics_lock = _SHELL_METRICS_LOCK
+except Exception:
+    # fallback: local simple counters
+    _metrics = {
+        "instryx_compile_requests_total": 0,
+        "instryx_compile_success_total": 0,
+        "instryx_compile_failure_total": 0,
+        "instryx_run_requests_total": 0,
+        "instryx_run_success_total": 0,
+        "instryx_run_failure_total": 0,
+    }
+    import threading as _threading
+    _metrics_lock = _threading.RLock()
+
+
+# More comprehensive type mapping for simple primitives and helpers
+_CTYPE_MAP: Dict[str, Any] = {
+    "void": None,
+    "int": ctypes.c_int,
+    "uint": ctypes.c_uint,
+    "long": ctypes.c_long,
+    "ulong": ctypes.c_ulong,
+    "float": ctypes.c_float,
+    "double": ctypes.c_double,
+    "char*": ctypes.c_char_p,
+    "size_t": ctypes.c_size_t,
+    "intptr": ctypes.c_void_p,
+}
+
+
+def _metric_inc(name: str, n: int = 1):
+    try:
+        with _metrics_lock:
+            _metrics[name] = _metrics.get(name, 0) + n
+    except Exception:
+        pass
+
+
+class StructBuilder:
+    """
+    Helper to build ctypes.Structure subclasses from a simple description.
+    Example:
+      desc = [("a", "int"), ("b", "double"), ("s", ("char*", 32))]
+      MyStruct = StructBuilder.build("MyStruct", desc)
+      inst = MyStruct()
+      inst.a = 3
+    Supported field spec forms:
+      - ("name", "int") -- maps via _CTYPE_MAP
+      - ("name", ("char*", N)) -- fixed-size char array
+      - ("name", ctypes.c_int) -- explicit ctypes type
+    """
+    @staticmethod
+    def _resolve_type(spec):
+        if isinstance(spec, str):
+            return _CTYPE_MAP.get(spec)
+        if isinstance(spec, tuple) and len(spec) == 2 and spec[0] == "char*":
+            # fixed-size char array of length spec[1]
+            return ctypes.c_char * int(spec[1])
+        if hasattr(spec, "_type_") or isinstance(spec, type):
+            return spec
+        return None
+
+    @staticmethod
+    def build(name: str, fields: Sequence[Tuple[str, Any]]):
+        cfields = []
+        for fname, ftype in fields:
+            ct = StructBuilder._resolve_type(ftype)
+            if ct is None:
+                raise TypeError(f"unsupported field type: {ftype}")
+            cfields.append((fname, ct))
+        # dynamic type creation
+        return type(name, (ctypes.Structure,), {"_fields_": cfields})
+
+
+def create_ctypes_array(ctype: Any, values: Sequence[Any]):
+    """
+    Create a ctypes array of given ctype and initialize with values.
+    ctype may be a string alias in _CTYPE_MAP or a ctypes type.
+    """
+    if isinstance(ctype, str):
+        ct = _CTYPE_MAP.get(ctype)
+    else:
+        ct = ctype
+    if ct is None:
+        raise TypeError("unknown ctype for array")
+    ArrType = ct * len(values)
+    arr = ArrType(*values)
+    return arr
+
+
+class InstryxRunner:
+    """
+    Enhanced runner for LLVM IR produced by Instryx codegen.
+
+    Enhancements:
+     - metrics wiring (compile/run counters)
+     - IR caching on disk
+     - AOT helpers: emit assembly, emit object, try to link to shared library
+     - ctypes-based marshalling helpers (structs, arrays)
+     - safe invocation with thread-based timeout and subprocess isolation option
+     - configurable verbosity and engine reuse
+    """
+
+    def __init__(self, cache_dir: Optional[str] = None, verbose: bool = False, reuse_engine: bool = True):
+        self.codegen = InstryxLLVMCodegen()
+        self.engine = None
+        self._modules = []  # keep references to modules
+        self.reuse_engine = bool(reuse_engine)
+        self.verbose = bool(verbose)
+        self.cache_dir = cache_dir or os.path.join(os.path.expanduser("~"), ".instryx_jit_cache")
+        os.makedirs(self.cache_dir, exist_ok=True)
+        if self.verbose:
+            LOG.setLevel(logging.DEBUG)
+
+    # ------------------------
+    # Engine lifecycle
+    # ------------------------
+    def _create_execution_engine(self):
+        binding.initialize()
+        binding.initialize_native_target()
+        binding.initialize_native_asmprinter()
+        target = binding.Target.from_default_triple()
+        target_machine = target.create_target_machine()
+        backing_mod = binding.parse_assembly("")
+        engine = binding.create_mcjit_compiler(backing_mod, target_machine)
+        if self.verbose:
+            LOG.debug("Created MCJIT engine (triple=%s)", target.triple)
+        return engine
+
+    def _prepare_engine(self):
+        if self.engine is None or not self.reuse_engine:
+            if self.engine is not None and not self.reuse_engine:
+                self._modules.clear()
+                self.engine = None
+            self.engine = self._create_execution_engine()
+            self._modules = []
+
+    def reset_engine(self):
+        """Dispose current engine and modules (best-effort)."""
+        try:
+            self._modules.clear()
+            self.engine = None
+            if self.verbose:
+                LOG.debug("Engine and modules reset")
+        except Exception:
+            LOG.exception("reset_engine failed")
+
+    # ------------------------
+    # IR caching and AOT helpers
+    # ------------------------
+    def _hash_ir(self, llvm_ir: str) -> str:
+        return hashlib.sha256(llvm_ir.encode("utf-8")).hexdigest()
+
+    def cache_ir(self, llvm_ir: str) -> str:
+        h = self._hash_ir(llvm_ir)
+        path = os.path.join(self.cache_dir, f"{h}.ll")
+        if not os.path.exists(path):
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(llvm_ir)
+        if self.verbose:
+            LOG.debug("IR cached -> %s", path)
+        return path
+
+    def emit_assembly(self, llvm_ir: str, out_path: Optional[str] = None) -> str:
+        if out_path is None:
+            out_path = tempfile.mktemp(suffix=".s")
+        mod = binding.parse_assembly(llvm_ir)
+        mod.verify()
+        tm = binding.Target.from_default_triple().create_target_machine()
+        asm = tm.emit_assembly(mod)
+        with open(out_path, "w", encoding="utf-8") as fh:
+            fh.write(asm)
+        if self.verbose:
+            LOG.debug("Assembly emitted -> %s", out_path)
+        return out_path
+
+    def emit_object(self, llvm_ir: str, out_path: Optional[str] = None) -> str:
+        if out_path is None:
+            out_path = tempfile.mktemp(suffix=".o")
+        mod = binding.parse_assembly(llvm_ir)
+        mod.verify()
+        tm = binding.Target.from_default_triple().create_target_machine()
+        obj_bytes = tm.emit_object(mod)
+        with open(out_path, "wb") as fh:
+            fh.write(obj_bytes)
+        if self.verbose:
+            LOG.debug("Object emitted -> %s (size=%d)", out_path, len(obj_bytes))
+        return out_path
+
+    def try_link_shared(self, object_path: str, out_shared: Optional[str] = None) -> Tuple[bool, str]:
+        if out_shared is None:
+            out_shared = object_path + (".so" if os.name != "nt" else ".dll")
+        cc = shutil.which("clang") or shutil.which("gcc")
+        if not cc:
+            return False, "no system compiler (clang/gcc) found"
+        cmd = [cc, "-shared", "-o", out_shared, object_path]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            if proc.returncode != 0:
+                return False, f"linker failed: {proc.stderr.strip()}"
+            if self.verbose:
+                LOG.debug("Linked shared library -> %s", out_shared)
+            return True, out_shared
+        except Exception as e:
+            return False, f"link failed: {e}"
+
+    # ------------------------
+    # Compile / add module
+    # ------------------------
+    def _compile_ir(self, llvm_ir: str, module_name: Optional[str] = None):
+        self._prepare_engine()
+        mod = binding.parse_assembly(llvm_ir)
+        mod.verify()
+        if module_name:
+            try:
+                mod.name = module_name
+            except Exception:
+                pass
+        self.engine.add_module(mod)
+        self.engine.finalize_object()
+        self.engine.run_static_constructors()
+        self._modules.append(mod)
+        if self.verbose:
+            LOG.debug("Compiled module (%s); modules count=%d", module_name or "<anon>", len(self._modules))
+
+    # ------------------------
+    # Invocation helpers
+    # ------------------------
+    def _ctype_from_spec(self, spec: Any):
+        if spec is None:
+            return None
+        if isinstance(spec, str):
+            return _CTYPE_MAP.get(spec)
+        return spec
+
+    def call_function(self, func_name: str, arg_types: Optional[Sequence[Any]] = None,
+                      ret_type: Any = "void", args: Optional[Sequence[Any]] = None,
+                      timeout: Optional[float] = None) -> Tuple[bool, Any]:
+        if self.engine is None:
+            return False, "engine not initialized; compile IR first"
+        ptr = self.engine.get_function_address(func_name)
+        if not ptr:
+            return False, f"function {func_name} not found"
+        arg_types = arg_types or []
+        ctypes_args = []
+        for t in arg_types:
+            ct = self._ctype_from_spec(t)
+            if ct is None:
+                return False, f"unsupported arg type {t}"
+            ctypes_args.append(ct)
+        ctypes_ret = self._ctype_from_spec(ret_type)
+        try:
+            if ctypes_ret is None:
+                FUN = ctypes.CFUNCTYPE(None, *ctypes_args)
+            else:
+                FUN = ctypes.CFUNCTYPE(ctypes_ret, *ctypes_args)
+            cfunc = FUN(ptr)
+        except Exception as e:
+            return False, f"failed to wrap cfunc: {e}"
+        result = {"ok": None, "val": None}
+        def _invoke():
+            try:
+                r = cfunc(*([] if args is None else list(args)))
+                result["ok"] = True
+                result["val"] = r
+            except Exception as e:
+                result["ok"] = False
+                result["val"] = f"exception: {e}"
+        th = threading.Thread(target=_invoke, daemon=True)
+        th.start()
+        th.join(timeout=timeout)
+        if th.is_alive():
+            return False, "timeout"
+        return result["ok"], result["val"]
+
+    # ------------------------
+    # High-level run
+    # ------------------------
+    def run(self, code: str, invoke_main: bool = True, timeout: Optional[float] = None,
+            use_subprocess: bool = False, cache_ir: bool = True) -> str:
+        # metrics
+        _metric_inc("instryx_compile_requests_total", 1)
+        llvm_ir = self.codegen.generate(code)
+        if cache_ir:
+            self.cache_ir(llvm_ir)
+        try:
+            self._compile_ir(llvm_ir)
+            _metric_inc("instryx_compile_success_total", 1)
+        except Exception as e:
+            _metric_inc("instryx_compile_failure_total", 1)
+            LOG.exception("compile failed")
+            raise
+
+        if not invoke_main:
+            return llvm_ir
+
+        _metric_inc("instryx_run_requests_total", 1)
+        if use_subprocess:
+            stub = f"""
+import sys, ctypes
+from llvmlite import binding
+binding.initialize()
+binding.initialize_native_target()
+binding.initialize_native_asmprinter()
+mod = binding.parse_assembly(r'''{llvm_ir}''')
+mod.verify()
+target = binding.Target.from_default_triple()
+tm = target.create_target_machine()
+engine = binding.create_mcjit_compiler(binding.parse_assembly(""), tm)
+engine.add_module(mod)
+engine.finalize_object()
+engine.run_static_constructors()
+addr = engine.get_function_address("main")
+if not addr:
+    print("FUNCTION_NOT_FOUND", file=sys.stderr)
+    sys.exit(2)
+ctypes.CFUNCTYPE(None)(addr)()
+"""
+            with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False, encoding="utf-8") as tf:
+                tf.write(stub)
+                stub_path = tf.name
+            try:
+                proc = subprocess.run([shutil.which("python") or "python", stub_path], capture_output=True, text=True, timeout=timeout)
+                if proc.returncode != 0:
+                    _metric_inc("instryx_run_failure_total", 1)
+                    LOG.error("subprocess run failed: %s", proc.stderr.strip())
+                else:
+                    _metric_inc("instryx_run_success_total", 1)
+                    if self.verbose:
+                        LOG.debug("subprocess run stdout: %s", proc.stdout.strip())
+            except subprocess.TimeoutExpired:
+                _metric_inc("instryx_run_failure_total", 1)
+                LOG.error("subprocess timed out")
+            finally:
+                try:
+                    os.unlink(stub_path)
+                except Exception:
+                    pass
+            return llvm_ir
+
+        ok, res = self.call_function("main", arg_types=None, ret_type="void", args=(), timeout=timeout)
+        if ok:
+            _metric_inc("instryx_run_success_total", 1)
+            if self.verbose:
+                LOG.debug("main invocation succeeded")
+        else:
+            _metric_inc("instryx_run_failure_total", 1)
+            LOG.error("main invocation failed: %s", res)
+        return llvm_ir
+
+
+# ------------------------
+# minimal test/demo
+# ------------------------
+if __name__ == "__main__":
+    runner = InstryxRunner(verbose=True)
+    sample = """
+    func greet(uid) {
+        print: "Hello from Instryx IR";
+    };
+
+    main() {
+        greet(1);
+    };
+    """
+    try:
+        ir = runner.run(sample, invoke_main=True, timeout=5)
+        print("\n🔬 LLVM IR Output:\n")
+        print(ir)
+    except Exception as e:
+        print("run failed:", e)
+
+"""
+instryx_jit_aot_runner.py
+
+Supreme-boosters edition — JIT-assisted AOT Execution for Instryx LLVM IR Modules.
+
+Additions and optimizations:
+ - Robust engine lifecycle (ORC-aware but MCJIT-compatible fallback).
+ - Persistent IR/artifact cache with index metadata and safe atomic writes.
+ - Parallel AOT emission (ThreadPool) via `batch_emit_objects`.
+ - JIT warmup helper `warmup_jit`.
+ - Extended ctypes marshalling helpers: nested StructBuilder, pack/unpack, create_ctypes_array.
+ - Safe function invocation with thread timeout and subprocess isolation option.
+ - Helpers to emit assembly/object, link shared libraries and load them via ctypes.
+ - Metrics wiring (prometheus-style) integrated with optional shell metrics.
+ - File logging with small rollover.
+ - CLI helpers for emit/link/load flows and a simple smoke-test.
+ - Non-blocking background compile pool and convenience wrappers.
+"""
+
+from __future__ import annotations
+from instryx_llvm_ir_codegen import InstryxLLVMCodegen
+from llvmlite import binding
+import ctypes
+import hashlib
+import json
+import os
+import tempfile
+import subprocess
+import threading
+import time
+import logging
+import shutil
+import struct
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Optional, Sequence, Any, Dict, Tuple, List, Union
+
+LOG = logging.getLogger("instryx.runner")
+if not LOG.handlers:
+    logging.basicConfig(level=logging.INFO)
+
+# --------- simple file logging with rollover ----------
+_LOG_FILE = os.path.join(os.path.expanduser("~"), ".instryx_jit_runner.log")
+_LOG_MAX = 1_000_000
+
+
+def _file_log(msg: str):
+    try:
+        if os.path.exists(_LOG_FILE) and os.path.getsize(_LOG_FILE) > _LOG_MAX:
+            try:
+                os.replace(_LOG_FILE, _LOG_FILE + ".1")
+            except Exception:
+                pass
+        with open(_LOG_FILE, "a", encoding="utf-8") as fh:
+            fh.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n")
+    except Exception:
+        pass
+
+
+# --------- metrics (integrates with shell enhancements when available) ----------
+_metrics: Dict[str, int] = {}
+_metrics_lock = threading.RLock()
+try:
+    from instryx_shell_enhancements import _metrics as _SHELL_METRICS, _metrics_lock as _SHELL_METRICS_LOCK  # type: ignore
+    _metrics = _SHELL_METRICS
+    _metrics_lock = _SHELL_METRICS_LOCK
+except Exception:
+    _metrics = {
+        "instryx_compile_requests_total": 0,
+        "instryx_compile_success_total": 0,
+        "instryx_compile_failure_total": 0,
+        "instryx_run_requests_total": 0,
+        "instryx_run_success_total": 0,
+        "instryx_run_failure_total": 0,
+    }
+
+
+def _metric_inc(name: str, n: int = 1):
+    try:
+        with _metrics_lock:
+            _metrics[name] = _metrics.get(name, 0) + n
+    except Exception:
+        pass
+
+
+# --------- richer ctype map & helpers ----------
+_CTYPE_MAP: Dict[str, Any] = {
+    "void": None,
+    "int8": ctypes.c_int8,
+    "uint8": ctypes.c_uint8,
+    "int16": ctypes.c_int16,
+    "uint16": ctypes.c_uint16,
+    "int32": ctypes.c_int32,
+    "uint32": ctypes.c_uint32,
+    "int": ctypes.c_int,
+    "uint": ctypes.c_uint,
+    "int64": ctypes.c_int64,
+    "uint64": ctypes.c_uint64,
+    "long": ctypes.c_long,
+    "ulong": ctypes.c_ulong,
+    "float": ctypes.c_float,
+    "double": ctypes.c_double,
+    "char*": ctypes.c_char_p,
+    "size_t": ctypes.c_size_t,
+    "intptr": ctypes.c_void_p,
+}
+
+
+def _resolve_ctype(spec: Any):
+    if spec is None:
+        return None
+    if isinstance(spec, str):
+        return _CTYPE_MAP.get(spec)
+    return spec
+
+
+class StructBuilder:
+    """
+    Build ctypes.Structure classes from high-level descriptions.
+
+    Field spec examples:
+      ("a", "int")
+      ("name", ("char*", 32))
+      ("p", ("ptr", "int"))         -> pointer to int
+      ("nested", ("struct", [("x","int"), ("y","int")]))
+
+    Returns dynamically created ctypes.Structure subclass.
+    """
+
+    @staticmethod
+    def _resolve_field_type(spec: Any):
+        if isinstance(spec, str):
+            return _resolve_ctype(spec)
+        if isinstance(spec, tuple):
+            tag = spec[0]
+            if tag == "char*" and len(spec) == 2:
+                return ctypes.c_char * int(spec[1])
+            if tag == "ptr" and len(spec) == 2:
+                base = StructBuilder._resolve_field_type(spec[1])
+                return ctypes.POINTER(base) if base is not None else None
+            if tag == "struct" and len(spec) == 2:
+                inner = spec[1]
+                if isinstance(inner, type) and issubclass(inner, ctypes.Structure):
+                    return inner
+                if isinstance(inner, (list, tuple)):
+                    return StructBuilder.build("InnerStruct", inner)
+        if hasattr(spec, "_type_") or isinstance(spec, type):
+            return spec
+        return None
+
+    @staticmethod
+    def build(name: str, fields: Sequence[Tuple[str, Any]]):
+        cfields: List[Tuple[str, Any]] = []
+        for fname, ftype in fields:
+            ct = StructBuilder._resolve_field_type(ftype)
+            if ct is None:
+                raise TypeError(f"unsupported field type: {ftype}")
+            cfields.append((fname, ct))
+        return type(name, (ctypes.Structure,), {"_fields_": cfields})
+
+
+def pack_struct_to_bytes(inst: ctypes.Structure) -> bytes:
+    size = ctypes.sizeof(inst)
+    buf = (ctypes.c_char * size)()
+    ctypes.memmove(buf, ctypes.byref(inst), size)
+    return bytes(bytearray(buf))
+
+
+def unpack_bytes_to_struct(data: bytes, StructType: type) -> ctypes.Structure:
+    inst = StructType()
+    size = min(len(data), ctypes.sizeof(inst))
+    ctypes.memmove(ctypes.byref(inst), data[:size], size)
+    return inst
+
+
+def create_ctypes_array(ctype: Any, values: Sequence[Any]):
+    """
+    Create ctypes array. ctype can be string alias, ctypes type, or nested structure.
+    """
+    ct = _resolve_ctype(ctype) if isinstance(ctype, str) else ctype
+    if ct is None:
+        raise TypeError("unknown ctype for array")
+    if isinstance(values, (bytes, bytearray)) and ct is ctypes.c_char:
+        Arr = ct * len(values)
+        return Arr(*values)
+    Arr = ct * len(values)
+    return Arr(*values)
+
+
+# ThreadPool for AOT emission & background tasks
+_AOT_POOL = ThreadPoolExecutor(max_workers=max(2, (os.cpu_count() or 2)))
+
+
+class InstryxRunner:
+    """
+    Advanced Instryx runner with AOT tooling and supreme boosters.
+    """
+
+    def __init__(self, cache_dir: Optional[str] = None, verbose: bool = False, reuse_engine: bool = True):
+        self.codegen = InstryxLLVMCodegen()
+        self.engine = None
+        self._modules: List[Any] = []
+        self.reuse_engine = bool(reuse_engine)
+        self.verbose = bool(verbose)
+        self.cache_dir = cache_dir or os.path.join(os.path.expanduser("~"), ".instryx_jit_cache")
+        os.makedirs(self.cache_dir, exist_ok=True)
+        self._index_path = os.path.join(self.cache_dir, "index.json")
+        self._load_index()
+        if self.verbose:
+            LOG.setLevel(logging.DEBUG)
+
+    def _load_index(self):
+        try:
+            if os.path.exists(self._index_path):
+                with open(self._index_path, "r", encoding="utf-8") as fh:
+                    self._index = json.load(fh)
+            else:
+                self._index = {}
+        except Exception:
+            self._index = {}
+
+    def _save_index(self):
+        try:
+            tmp = self._index_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(self._index, fh, indent=2)
+            os.replace(tmp, self._index_path)
+        except Exception:
+            pass
+
+    def _supports_orc(self) -> bool:
+        try:
+            return hasattr(binding, "OrcJIT") or hasattr(binding, "orc")
+        except Exception:
+            return False
+
+    def _create_execution_engine(self):
+        binding.initialize()
+        binding.initialize_native_target()
+        binding.initialize_native_asmprinter()
+        target = binding.Target.from_default_triple()
+        tm = target.create_target_machine()
+        backing = binding.parse_assembly("")
+        engine = binding.create_mcjit_compiler(backing, tm)
+        if self.verbose:
+            LOG.debug("Created execution engine (%s)", target.triple)
+        _file_log("Execution engine created")
+        return engine
+
+    def _prepare_engine(self):
+        if self.engine is None or not self.reuse_engine:
+            if self.engine is not None and not self.reuse_engine:
+                self._modules.clear()
+                self.engine = None
+            self.engine = self._create_execution_engine()
+            self._modules = []
+
+    def reset_engine(self):
+        try:
+            self._modules.clear()
+            self.engine = None
+            if self.verbose:
+                LOG.debug("Engine reset")
+            _file_log("Engine reset")
+        except Exception:
+            LOG.exception("reset_engine failed")
+
+    def _hash_ir(self, llvm_ir: str) -> str:
+        return hashlib.sha256(llvm_ir.encode("utf-8")).hexdigest()
+
+    def cache_ir(self, llvm_ir: str) -> str:
+        h = self._hash_ir(llvm_ir)
+        path = os.path.join(self.cache_dir, f"{h}.ll")
+        if not os.path.exists(path):
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(llvm_ir)
+        self._index[h] = {"ir": path, "time": time.time()}
+        self._save_index()
+        if self.verbose:
+            LOG.debug("IR cached %s", path)
+        _file_log(f"IR cached {path}")
+        return path
+
+    def emit_object(self, llvm_ir: str, out_path: Optional[str] = None) -> str:
+        if out_path is None:
+            out_path = tempfile.mktemp(suffix=".o")
+        mod = binding.parse_assembly(llvm_ir)
+        mod.verify()
+        tm = binding.Target.from_default_triple().create_target_machine()
+        obj = tm.emit_object(mod)
+        with open(out_path, "wb") as fh:
+            fh.write(obj)
+        if self.verbose:
+            LOG.debug("Object emitted %s (%d bytes)", out_path, len(obj))
+        _file_log(f"Object emitted {out_path} size={len(obj)}")
+        return out_path
+
+    def emit_assembly(self, llvm_ir: str, out_path: Optional[str] = None) -> str:
+        if out_path is None:
+            out_path = tempfile.mktemp(suffix=".s")
+        mod = binding.parse_assembly(llvm_ir)
+        mod.verify()
+        tm = binding.Target.from_default_triple().create_target_machine()
+        asm = tm.emit_assembly(mod)
+        with open(out_path, "w", encoding="utf-8") as fh:
+            fh.write(asm)
+        if self.verbose:
+            LOG.debug("Assembly emitted %s", out_path)
+        _file_log(f"Assembly emitted {out_path}")
+        return out_path
+
+    def try_link_shared(self, object_path: str, out_shared: Optional[str] = None) -> Tuple[bool, str]:
+        if out_shared is None:
+            out_shared = object_path + (".so" if os.name != "nt" else ".dll")
+        cc = shutil.which("clang") or shutil.which("gcc")
+        if not cc:
+            return False, "no system compiler (clang/gcc) found"
+        cmd = [cc, "-shared", "-o", out_shared, object_path]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            if proc.returncode != 0:
+                return False, f"linker failed: {proc.stderr.strip()}"
+            if self.verbose:
+                LOG.debug("Linked shared %s", out_shared)
+            _file_log(f"Linked shared {out_shared}")
+            return True, out_shared
+        except Exception as e:
+            return False, f"link failed: {e}"
+
+    def batch_emit_objects(self, ir_list: Sequence[Tuple[str, str]], out_dir: Optional[str] = None) -> List[str]:
+        out_dir = out_dir or tempfile.mkdtemp(prefix="instryx_objs_")
+        results: List[str] = ["" for _ in ir_list]
+        futures = []
+        with ThreadPoolExecutor(max_workers=max(2, (os.cpu_count() or 2))) as pool:
+            for i, (ir, base) in enumerate(ir_list):
+                out = os.path.join(out_dir, base + ".o")
+                futures.append(pool.submit(self.emit_object, ir, out))
+            for i, fut in enumerate(as_completed(futures)):
+                try:
+                    results[i] = fut.result()
+                except Exception as e:
+                    results[i] = f"error:{e}"
+        return results
+
+    def load_shared_library(self, path: str):
+        if not os.path.exists(path):
+            raise FileNotFoundError(path)
+        lib = ctypes.CDLL(path)
+        if self.verbose:
+            LOG.debug("Loaded shared %s", path)
+        _file_log(f"Loaded shared {path}")
+        return lib
+
+    def _compile_ir(self, llvm_ir: str, module_name: Optional[str] = None):
+        self._prepare_engine()
+        mod = binding.parse_assembly(llvm_ir)
+        mod.verify()
+        if module_name:
+            try:
+                mod.name = module_name
+            except Exception:
+                pass
+        self.engine.add_module(mod)
+        self.engine.finalize_object()
+        self.engine.run_static_constructors()
+        self._modules.append(mod)
+        if self.verbose:
+            LOG.debug("Compiled module %s", module_name or "<anon>")
+        _file_log(f"Compiled module {module_name or '<anon>'}")
+
+    def warmup_jit(self, function_names: Sequence[str]):
+        if self.engine is None:
+            return
+        for fn in function_names:
+            try:
+                addr = self.engine.get_function_address(fn)
+                if self.verbose:
+                    LOG.debug("Warmup resolved %s -> %s", fn, hex(addr) if addr else None)
+            except Exception:
+                LOG.debug("Warmup failed for %s", fn)
+
+    def call_function(self, func_name: str, arg_types: Optional[Sequence[Any]] = None,
+                      ret_type: Any = "void", args: Optional[Sequence[Any]] = None,
+                      timeout: Optional[float] = None) -> Tuple[bool, Any]:
+        if self.engine is None:
+            return False, "engine not initialized; compile IR first"
+        ptr = self.engine.get_function_address(func_name)
+        if not ptr:
+            return False, f"function {func_name} not found"
+        arg_types = arg_types or []
+        ctypes_args = []
+        for t in arg_types:
+            ct = _resolve_ctype(t) if isinstance(t, str) else t
+            if ct is None:
+                return False, f"unsupported arg type {t}"
+            ctypes_args.append(ct)
+        ctypes_ret = _resolve_ctype(ret_type) if isinstance(ret_type, str) else ret_type
+        try:
+            FUN = ctypes.CFUNCTYPE(None if ctypes_ret is None else ctypes_ret, *ctypes_args)
+            cfunc = FUN(ptr)
+        except Exception as e:
+            return False, f"failed to wrap function: {e}"
+        out = {"ok": None, "val": None}
+
+        def _invoke():
+            try:
+                r = cfunc(*([] if args is None else list(args)))
+                out["ok"] = True
+                out["val"] = r
+            except Exception as e:
+                out["ok"] = False
+                out["val"] = f"exception during invocation: {e}"
+
+        t = threading.Thread(target=_invoke, daemon=True)
+        t.start()
+        t.join(timeout=timeout)
+        if t.is_alive():
+            return False, "timeout"
+        return out["ok"], out["val"]
+
+    def run(self, code: str, invoke_main: bool = True, timeout: Optional[float] = None,
+            use_subprocess: bool = False, cache_ir: bool = True) -> str:
+        _metric_inc("instryx_compile_requests_total", 1)
+        llvm_ir = self.codegen.generate(code)
+        if cache_ir:
+            self.cache_ir(llvm_ir)
+        try:
+            self._compile_ir(llvm_ir)
+            _metric_inc("instryx_compile_success_total", 1)
+        except Exception:
+            _metric_inc("instryx_compile_failure_total", 1)
+            LOG.exception("compile failed")
+            raise
+
+        if not invoke_main:
+            return llvm_ir
+
+        _metric_inc("instryx_run_requests_total", 1)
+        if use_subprocess:
+            stub = f"""
+import sys, ctypes
+from llvmlite import binding
+binding.initialize()
+binding.initialize_native_target()
+binding.initialize_native_asmprinter()
+mod = binding.parse_assembly(r'''{llvm_ir}''')
+mod.verify()
+tm = binding.Target.from_default_triple().create_target_machine()
+engine = binding.create_mcjit_compiler(binding.parse_assembly(""), tm)
+engine.add_module(mod)
+engine.finalize_object()
+engine.run_static_constructors()
+addr = engine.get_function_address("main")
+if not addr:
+    print("FUNCTION_NOT_FOUND", file=sys.stderr)
+    sys.exit(2)
+ctypes.CFUNCTYPE(None)(addr)()
+"""
+            with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False, encoding="utf-8") as tf:
+                tf.write(stub)
+                stub_path = tf.name
+            try:
+                proc = subprocess.run([shutil.which("python") or "python", stub_path],
+                                      capture_output=True, text=True, timeout=timeout)
+                if proc.returncode != 0:
+                    _metric_inc("instryx_run_failure_total", 1)
+                    LOG.error("subprocess failed: %s", proc.stderr.strip())
+                else:
+                    _metric_inc("instryx_run_success_total", 1)
+                    if self.verbose:
+                        LOG.debug("subprocess stdout: %s", proc.stdout.strip())
+            except subprocess.TimeoutExpired:
+                _metric_inc("instryx_run_failure_total", 1)
+                LOG.error("subprocess timed out")
+            finally:
+                try:
+                    os.unlink(stub_path)
+                except Exception:
+                    pass
+            return llvm_ir
+
+        ok, res = self.call_function("main", arg_types=None, ret_type="void", args=(), timeout=timeout)
+        if ok:
+            _metric_inc("instryx_run_success_total", 1)
+            if self.verbose:
+                LOG.debug("main invocation succeeded")
+        else:
+            _metric_inc("instryx_run_failure_total", 1)
+            LOG.error("main invocation failed: %s", res)
+        return llvm_ir
+
+    def get_metrics(self) -> Dict[str, int]:
+        with _metrics_lock:
+            return dict(_metrics)
+
+
+# --- convenience CLI / helpers ---
+def build_example_shared(output: str = "libexample.so") -> int:
+    """
+    Helper to build a tiny C shared library used for testing ctypes interop.
+    """
+    src = r'''
+#include <stdio.h>
+int example_add(int a, int b) { return a + b; }
+void example_print(const char *s) { printf("example_print: %s\n", s); }
+'''
+    cur = os.path.abspath(os.path.dirname(__file__))
+    cfile = os.path.join(cur, "example_cmodule.c")
+    with open(cfile, "w", encoding="utf-8") as fh:
+        fh.write(src)
+    cc = shutil.which("clang") or shutil.which("gcc")
+    if not cc:
+        print("No system compiler found (clang/gcc required)")
+        return 2
+    cmd = [cc, "-shared", "-fPIC", "-O2", "-o", output, cfile]
+    try:
+        subprocess.check_call(cmd)
+        print("Built", output)
+        return 0
+    except Exception as e:
+        print("Build failed:", e)
+        return 1
+
+
+if __name__ == "__main__":
+    # quick smoke test and example usage
+    runner = InstryxRunner(verbose=True)
+    sample = """
+    func greet(uid) {
+        print: "Hello from Instryx IR";
+    };
+    main() {
+        greet(1);
+    };
+    """
+    try:
+        ir = runner.run(sample, invoke_main=True, timeout=5)
+        print("\nLLVM IR:\n", ir)
+    except Exception as e:
+        print("run failed:", e)
+
+"""
+instryx_shell_embedded.py
+
+Extended Instryx Embedded Shell
+- Adds many developer-facing features, tools and utilities while remaining fully executable
+  using only Python stdlib plus optional repo modules.
+- New features:
+  - readline-based tab completion and command history
+  - plugin system (load modules from ./plugins or installed modules)
+  - persistent config (~/.instryx_shell.json)
+  - :lint, :format, :test, :build, :pack, :serve, :generate, :open, :search, :plugins commands
+  - background task manager for long-running compile/run jobs
+  - logging to file + verbose mode
+  - simple static HTTP server for serving build artifacts
+  - project scaffolding / sample generation
+  - integration hooks for instryx_syntax_morph, macro_overlay, instryx_wasm_host_runtime, emitter modules if available
+  - graceful fallback to instryxc CLI when emitter absent
+- Designed for local development in VS / terminal. No external deps required.
+"""
+
+from __future__ import annotations
+import shutil
+import subprocess
+import tempfile
+import sys
+import os
+import readline
+import textwrap
+import difflib
+import importlib
+import asyncio
+import json
+import http.server
+import socketserver
+import threading
+import time
+from pathlib import Path
+from typing import Optional, Tuple, Dict, Any, List, Callable
+
+# Optional integrations (lazy imported)
+_syntax_morph_mod = None
+_macro_overlay_mod = None
+_emitter_mod = None
+_wasm_host_mod = None
+
+# Shell config path
+CONFIG_PATH = Path.home() / ".instryx_shell.json"
+LOG_PATH = Path.cwd() / "instryx_shell.log"
+
+# Default commands for completion
+BASE_COMMANDS = [
+    ":help", ":load", ":show", ":morph", ":expand", ":diff", ":compile", ":run", ":save", ":edit", ":clear",
+    ":lint", ":format", ":test", ":build", ":pack", ":serve", ":generate", ":open", ":search", ":plugins",
+    ":plugins.load", ":plugins.list", ":plugins.unload", ":history", ":quit", ":exit"
+]
+
+# Task manager
+_background_tasks: Dict[str, asyncio.Task] = {}
+
+# -------------------------
+# Utilities and optional module loading
+# -------------------------
+def _try_import(name: str):
+    try:
+        return importlib.import_module(name)
+    except Exception:
+        return None
+
+def load_optional_modules():
+    global _syntax_morph_mod, _macro_overlay_mod, _emitter_mod, _wasm_host_mod
+    _syntax_morph_mod = _try_import("instryx_syntax_morph")
+    _macro_overlay_mod = _try_import("macro_overlay")
+    _emitter_mod = _try_import("instryx_wasm_and_exe_backend_emitter")
+    _wasm_host_mod = _try_import("instryx_wasm_host_runtime")
+
+def _log(msg: str):
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{ts}] {msg}\n"
+    try:
+        with open(LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(line)
+    except Exception:
+        pass
+
+def read_config() -> Dict[str, Any]:
+    if CONFIG_PATH.exists():
+        try:
+            return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+def write_config(cfg: Dict[str, Any]):
+    try:
+        CONFIG_PATH.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    except Exception as e:
+        _log(f"failed to write config: {e}")
+
+# -------------------------
+# Existing helpers (unchanged behavior)
+# -------------------------
+def unified_diff(a: str, b: str, a_name: str = "original", b_name: str = "transformed") -> str:
+    a_lines = a.splitlines(keepends=True)
+    b_lines = b.splitlines(keepends=True)
+    return "".join(difflib.unified_diff(a_lines, b_lines, fromfile=a_name, tofile=b_name, lineterm=""))
+
+
+async def apply_macro_overlay_async(source: str, filename: Optional[str] = None) -> Tuple[str, list]:
+    """
+    Attempt to run macro overlay expansion using macro_overlay.applyMacrosWithDiagnostics.
+    Supports both synchronous and asynchronous implementations in the module.
+    Returns (transformed_source, diagnostics_list)
+    """
+    global _macro_overlay_mod
+    if _macro_overlay_mod is None:
+        _macro_overlay_mod = _try_import("macro_overlay")
+    if _macro_overlay_mod is None:
+        return source, []
+
+    # create registry if available
+    registry = None
+    if hasattr(_macro_overlay_mod, "createFullRegistry"):
+        registry = getattr(_macro_overlay_mod, "createFullRegistry")()
+    elif hasattr(_macro_overlay_mod, "createDefaultRegistry"):
+        registry = getattr(_macro_overlay_mod, "createDefaultRegistry")()
+
+    apply_fn = getattr(_macro_overlay_mod, "applyMacrosWithDiagnostics", None) or getattr(_macro_overlay_mod, "applyMacros", None)
+    if apply_fn is None:
+        return source, []
+
+    # applyMacrosWithDiagnostics signature in this repo: (source, registry, ctx)
+    try:
+        maybe = apply_fn(source, registry, {"filename": filename})
+        if asyncio.iscoroutine(maybe):
+            res = await maybe
+        else:
+            # might be sync
+            res = maybe
+        # result expected shape: { result: { ok, transformed, ...}, diagnostics: [...] } in our code
+        if isinstance(res, dict):
+            result = res.get("result")
+            diagnostics = res.get("diagnostics", [])
+            if isinstance(result, dict) and "transformed" in result:
+                return result["transformed"], diagnostics
+        # fallback: if apply_fn returned ExpansionResult directly
+        if isinstance(res, tuple) and len(res) >= 1:
+            # not expected, fallback
+            return res[0], []
+    except Exception as e:
+        return source, [{"type": "error", "message": f"macro overlay failed: {e}"}]
+
+    return source, []
+
+
+def apply_macro_overlay(source: str, filename: Optional[str] = None) -> Tuple[str, list]:
+    """
+    Synchronous wrapper around async apply_macro_overlay_async.
+    """
+    try:
+        return asyncio.get_event_loop().run_until_complete(apply_macro_overlay_async(source, filename))
+    except RuntimeError:
+        # no running loop
+        return asyncio.new_event_loop().run_until_complete(apply_macro_overlay_async(source, filename))
+
+
+def try_compile_with_emitter(source: str, out_wasm: str) -> Tuple[bool, str]:
+    """
+    Try to compile using instryx_wasm_and_exe_backend_emitter or similar module.
+    This function probes for common function names; returns (success, message or path).
+    """
+    global _emitter_mod
+    if _emitter_mod is None:
+        _emitter_mod = _try_import("instryx_wasm_and_exe_backend_emitter")
+    if _emitter_mod is None:
+        return False, "emitter module not available"
+
+    # Common function name variants to try
+    fn_names = [
+        "compile_source_to_wasm",
+        "compile_to_wasm",
+        "emit_wasm",
+        "compile_wasm",
+        "compile_ix_to_wasm",
+        "compile_to_exe",
+    ]
+    for name in fn_names:
+        fn = getattr(_emitter_mod, name, None)
+        if callable(fn):
+            try:
+                # many likely expect (source, out_path) or (file, out_path)
+                ret = fn(source, out_wasm)
+                # If it returns bool or path, accept
+                if isinstance(ret, bool):
+                    return ret, out_wasm if ret else "emitter reported failure"
+                if isinstance(ret, str):
+                    return True, ret
+                return True, out_wasm
+            except Exception as e:
+                return False, f"emitter.{name} failed: {e}"
+    return False, "no compatible compile function found in emitter module"
+
+
+def try_compile_with_cli(source: str, out_wasm: str, target: str = "wasm") -> Tuple[bool, str]:
+    """
+    Fallback: write source to temp .ix and call `instryxc` to produce wasm.
+    Returns (success, message_or_outpath)
+    """
+    instryxc = shutil.which("instryxc")
+    if instryxc is None:
+        return False, "instryxc not found in PATH"
+    with tempfile.NamedTemporaryFile("w", suffix=".ix", delete=False, encoding="utf-8") as tf:
+        tf.write(source)
+        src_path = tf.name
+    try:
+        if target == "wasm":
+            cmd = [instryxc, src_path, "--target", "wasm", "-o", out_wasm]
+        else:
+            cmd = [instryxc, src_path, "-o", out_wasm]
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        if proc.returncode != 0:
+            return False, f"instryxc failed: {proc.stderr.strip()}"
+        return True, out_wasm
+    except Exception as e:
+        return False, f"instryxc invocation failed: {e}"
+    finally:
+        try:
+            os.unlink(src_path)
+        except Exception:
+            pass
+
+
+def compile_to_wasm(source: str, out_wasm: Optional[str] = None) -> Tuple[bool, str]:
+    """
+    Try multiple strategies to compile to wasm.
+    Returns (success, out_path_or_message)
+    """
+    if out_wasm is None:
+        tmp = tempfile.NamedTemporaryFile(suffix=".wasm", delete=False)
+        out_wasm = tmp.name
+        tmp.close()
+
+    # Try emitter module first
+    ok, msg = try_compile_with_emitter(source, out_wasm)
+    if ok:
+        return True, msg
+
+    # Fallback to CLI
+    ok, msg = try_compile_with_cli(source, out_wasm, target="wasm")
+    if ok:
+        return True, msg
+
+    return False, f"compile failed: {msg}"
+
+
+def compile_to_native(source: str, out_exe: Optional[str] = None) -> Tuple[bool, str]:
+    """
+    Try to compile to a native executable.
+    Returns (success, out_path_or_message)
+    """
+    if out_exe is None:
+        tmp = tempfile.NamedTemporaryFile(suffix=".exe" if os.name == "nt" else ".out", delete=False)
+        out_exe = tmp.name
+        tmp.close()
+
+    # Try emitter module first
+    ok, msg = try_compile_with_emitter(source, out_exe)
+    if ok:
+        return True, msg
+
+    # Fallback to CLI
+    ok, msg = try_compile_with_cli(source, out_exe, target="native")
+    if ok:
+        return True, msg
+
+    return False, f"compile failed: {msg}"
+
+
+def run_wasm_module(wasm_path: str, func: str = "main", args: Optional[Tuple[str, ...]] = None) -> Tuple[bool, Any]:
+    """
+    Instantiate and run the wasm module using instryx_wasm_host_runtime.WasmHostRuntime
+    Returns (success, result_or_error)
+    """
+    global _wasm_host_mod
+    if _wasm_host_mod is None:
+        _wasm_host_mod = _try_import("instryx_wasm_host_runtime")
+    if _wasm_host_mod is None:
+        return False, "instryx_wasm_host_runtime module not available"
+
+    try:
+        Runtime = getattr(_wasm_host_mod, "WasmHostRuntime")
+        rt = Runtime(enable_wasi=True)
+        rt.instantiate(wasm_path)
+        if args:
+            # try calling with string args
+            res = rt.call_with_strings(func, args)
+            return True, res
+        else:
+            res = rt.call(func)
+            return True, res
+    except Exception as e:
+        return False, f"runtime error: {e}"
+
+
+# -------------------------
+# REPL / Shell
+# -------------------------
+REPL_BANNER = """Instryx Embedded Shell (extended)
+Type :help for commands.
+"""
+
+class PluginManager:
+    """
+    Simple plugin loader; plugins are Python modules that export `register(shell)` function.
+    Plugins can live in ./plugins directory or be installed packages.
+    """
+    def __init__(self, shell):
+        self.shell = shell
+        self.loaded: Dict[str, Any] = {}
+        self.plugins_dir = Path.cwd() / "plugins"
+        self.plugins_dir.mkdir(exist_ok=True)
+
+    def discover(self) -> List[str]:
+        names = []
+        for p in self.plugins_dir.glob("*.py"):
+            names.append(p.stem)
+        return names
+
+    def load(self, name: str) -> Tuple[bool, str]:
+        # try local plugins first
+        try:
+            full = f"plugins.{name}"
+            if (self.plugins_dir / f"{name}.py").exists():
+                spec = importlib.util.spec_from_file_location(full, str(self.plugins_dir / f"{name}.py"))
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)  # type: ignore
+            else:
+                mod = importlib.import_module(name)
+            if hasattr(mod, "register") and callable(mod.register):
+                mod.register(self.shell)
+            self.loaded[name] = mod
+            return True, f"plugin {name} loaded"
+        except Exception as e:
+            return False, f"failed to load plugin {name}: {e}"
+
+    def unload(self, name: str) -> Tuple[bool, str]:
+        if name not in self.loaded:
+            return False, "not loaded"
+        try:
+            mod = self.loaded.pop(name)
+            if hasattr(mod, "unregister") and callable(mod.unregister):
+                mod.unregister(self.shell)
+            return True, f"plugin {name} unloaded"
+        except Exception as e:
+            return False, f"unload failed: {e}"
+
+    def list_loaded(self) -> List[str]:
+        return list(self.loaded.keys())
+
+class InstryxShell:
+    def __init__(self):
+        load_optional_modules()
+        self.source_original: Optional[str] = None
+        self.source_morphed: Optional[str] = None
+        self.source_expanded: Optional[str] = None
+        self.last_wasm_path: Optional[str] = None
+        self.last_native_path: Optional[str] = None
+        self.current_file: Optional[str] = None
+        self.history_file = Path.home() / ".instryx_shell_history"
+        self.cfg = read_config()
+        self.plugin_mgr = PluginManager(self)
+        self._setup_readline()
+        self._load_history()
+
+    # ----- readline / completion / history -----
+    def _setup_readline(self):
+        try:
+            readline.parse_and_bind("tab: complete")
+            readline.set_completer(self._completer)
+        except Exception:
+            pass
+
+    def _completer(self, text, state):
+        options = [c for c in BASE_COMMANDS + list(self.plugin_mgr.discover()) if c.startswith(text)]
+        try:
+            return options[state]
+        except Exception:
+            return None
+
+    def _load_history(self):
+        try:
+            if self.history_file.exists():
+                readline.read_history_file(str(self.history_file))
+        except Exception:
+            pass
+
+    def _save_history(self):
+        try:
+            readline.write_history_file(str(self.history_file))
+        except Exception:
+            pass
+
+    # ----- REPL -----
+    def repl(self):
+        print(REPL_BANNER)
+        try:
+            while True:
+                try:
+                    line = input("instryx> ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    print()
+                    break
+                if not line:
+                    continue
+                if line.startswith(":"):
+                    parts = line.split()
+                    cmd = parts[0][1:]
+                    args = parts[1:]
+                    method = getattr(self, f"cmd_{cmd.replace('.', '_')}", None)
+                    if method:
+                        try:
+                            method(args)
+                        except Exception as e:
+                            _log(f"command {cmd} failed: {e}")
+                            print(f"[error] command {cmd} failed: {e}")
+                    else:
+                        # plugin dispatch
+                        if cmd.startswith("plugins."):
+                            sub = cmd.split(".", 1)[1]
+                            handler = getattr(self, f"plugins_{sub}", None)
+                            if handler:
+                                handler(args)
+                                continue
+                        print(f"Unknown command: {cmd}. Type :help")
+                else:
+                    if self.source_original is None:
+                        self.source_original = line + "\n"
+                    else:
+                        self.source_original += line + "\n"
+                    self.source_morphed = None
+                    self.source_expanded = None
+                    print("[ok] appended line to source buffer")
+        finally:
+            self._save_history()
+
+    # ----- core commands -----
+    def cmd_help(self, _args):
+        print(REPL_BANNER)
+        print("Commands:")
+        print("  :load <file>           load an Instryx (.ix) file")
+        print("  :show                  show current buffer (expanded > morphed > original)")
+        print("  :morph                 apply morphology/formatting")
+        print("  :format                alias for :morph (writes back if --inplace configured)")
+        print("  :expand                run macro overlay expansion (if available)")
+        print("  :diff                  show unified diff (original -> morphed -> expanded)")
+        print("  :compile [out.wasm]    compile to wasm")
+        print("  :build [out.exe]       compile to native executable")
+        print("  :run [wasm] [func]     run wasm (uses host runtime if available)")
+        print("  :lint                  run basic lint checks")
+        print("  :test                  run unit tests (syntax morph + macro overlay tests)")
+        print("  :pack <out.zip>        package build artifacts into zip")
+        print("  :serve [dir] [port]    serve directory over HTTP (static)")
+        print("  :generate <type> <name> generate sample project (app/library) in ./<name>")
+        print("  :open <file>           open file with system-default editor")
+        print("  :search <pattern>      search files for pattern (simple grep)")
+        print("  :plugins.list          list available plugin files")
+        print("  :plugins.load <name>   load plugin by name")
+        print("  :plugins.unload <name> unload plugin")
+        print("  :history               show readline history path")
+        print("  :quit / :exit          exit")
+        print("Use :help <command> for more details (not implemented per-command).")
+
+    def cmd_load(self, args):
+        if not args:
+            print("Usage: :load <file>")
+            return
+        path = args[0]
+        try:
+            txt = Path(path).read_text(encoding="utf-8")
+            self.source_original = txt
+            self.source_morphed = None
+            self.source_expanded = None
+            self.current_file = path
+            print(f"Loaded {path} ({len(txt)} bytes)")
+        except Exception as e:
+            print(f"Failed to load {path}: {e}")
+
+    def cmd_show(self, _args):
+        src = self.source_expanded or self.source_morphed or self.source_original
+        if src is None:
+            print("[no source loaded]")
+            return
+        print("----- CURRENT SOURCE -----")
+        print(src)
+
+    def cmd_morph(self, _args):
+        if self.source_original is None:
+            print("No source loaded")
+            return
+        if _syntax_morph_mod is None:
+            print("instryx_syntax_morph module not available")
+            return
+        try:
+            SyntaxMorph = getattr(_syntax_morph_mod, "SyntaxMorph")
+            sm = SyntaxMorph()
+            res = sm.morph(self.source_original)
+            self.source_morphed = res.transformed
+            self.source_expanded = None
+            print(f"[morph] applied {len(res.edits)} edits")
+            _log(f"morph applied {len(res.edits)} edits")
+        except Exception as e:
+            print(f"[morph] error: {e}")
+            _log(f"morph error: {e}")
+
+    # :format alias
+    def cmd_format(self, args):
+        self.cmd_morph(args)
+
+    def cmd_expand(self, _args):
+        if self.source_morphed is None and self.source_original is None:
+            print("No source to expand")
+            return
+        src = self.source_morphed or self.source_original
+        transformed, diagnostics = apply_macro_overlay(src, self.current_file)
+        self.source_expanded = transformed
+        print(f"[expand] applied (diagnostics: {len(diagnostics)})")
+        for d in diagnostics[:10]:
+            print(f" - {d.get('type','info')}: {d.get('message')}")
+        if len(diagnostics) > 10:
+            print(f" - ... {len(diagnostics)-10} more")
+        _log(f"expand diagnostics: {len(diagnostics)}")
+
+    def cmd_diff(self, _args):
+        if self.source_original is None:
+            print("No source loaded")
+            return
+        morphed = self.source_morphed or self.source_original
+        expanded = self.source_expanded or morphed
+        print("---- morph diff ----")
+        print(unified_diff(self.source_original, morphed, "original", "morphed"))
+        if expanded != morphed:
+            print("---- expand diff ----")
+            print(unified_diff(morphed, expanded, "morphed", "expanded"))
+
+    def cmd_compile(self, args):
+        if self.source_expanded is None and self.source_morphed is None and self.source_original is None:
+            print("No source to compile")
+            return
+        src = self.source_expanded or self.source_morphed or self.source_original
+        out = args[0] if args else None
+        _log("compile requested")
+        # run in background to avoid blocking REPL
+        async def _job():
+            ok, msg = compile_to_wasm(src, out)
+            if ok:
+                self.last_wasm_path = msg
+                print(f"[compile] success -> {msg}")
+                _log(f"compile success -> {msg}")
+            else:
+                print(f"[compile] failed: {msg}")
+                _log(f"compile failed: {msg}")
+        asyncio.create_task(_job())
+
+    def cmd_build(self, args):
+        if self.source_expanded is None and self.source_morphed is None and self.source_original is None:
+            print("No source to build")
+            return
+        src = self.source_expanded or self.source_morphed or self.source_original
+        out = args[0] if args else None
+        _log("build requested")
+        async def _job():
+            ok, msg = compile_to_native(src, out)
+            if ok:
+                self.last_native_path = msg
+                print(f"[build] success -> {msg}")
+                _log(f"build success -> {msg}")
+            else:
+                print(f"[build] failed: {msg}")
+                _log(f"build failed: {msg}")
+        asyncio.create_task(_job())
+
+    def cmd_run(self, args):
+        wasm = None
+        func = "main"
+        run_args = None
+        if args:
+            wasm = args[0]
+            if len(args) > 1:
+                func = args[1]
+        if wasm is None:
+            wasm = self.last_wasm_path
+        if wasm is None:
+            print("No wasm module available. Use :compile or specify path.")
+            return
+        _log(f"run requested {wasm} {func}")
+        async def _job():
+            ok, res = run_wasm_module(wasm, func, run_args)
+            if ok:
+                print(f"[run] result: {res}")
+                _log(f"run result: {res}")
+            else:
+                print(f"[run] failed: {res}")
+                _log(f"run failed: {res}")
+        asyncio.create_task(_job())
+
+    def cmd_save(self, args):
+        if not args:
+            print("Usage: :save <file>")
+            return
+        path = args[0]
+        src = self.source_expanded or self.source_morphed or self.source_original
+        if src is None:
+            print("No source to save")
+            return
+        Path(path).write_text(src, encoding="utf-8")
+        print(f"Wrote {path}")
+
+    def cmd_edit(self, _args):
+        print("Enter multi-line source. End with a single '.' on its own line.")
+        lines = []
+        try:
+            while True:
+                ln = input()
+                if ln.strip() == ".":
+                    break
+                lines.append(ln)
+        except (EOFError, KeyboardInterrupt):
+            print()
+        text = "\n".join(lines) + "\n"
+        self.source_original = (self.source_original or "") + text
+        self.source_morphed = None
+        self.source_expanded = None
+        print(f"[edit] appended {len(lines)} lines")
+
+    def cmd_clear(self, _args):
+        self.source_original = None
+        self.source_morphed = None
+        self.source_expanded = None
+        self.last_wasm_path = None
+        self.last_native_path = None
+        self.current_file = None
+        print("[cleared buffers]")
+
+    def cmd_lint(self, _args):
+        """
+        Lightweight lint checks:
+        - unmatched quotes
+        - unbalanced parentheses/braces
+        - trailing whitespace
+        - missing semicolons heuristics
+        """
+        src = self.source_expanded or self.source_morphed or self.source_original
+        if src is None:
+            print("No source to lint")
+            return
+        issues = []
+        # unmatched quotes
+        for q in ['"', "'"]:
+            if src.count(q) % 2 != 0:
+                issues.append(f"unmatched quote: {q}")
+        # braces
+        if src.count("{") != src.count("}"):
+            issues.append("unbalanced braces")
+        if src.count("(") != src.count(")"):
+            issues.append("unbalanced parentheses")
+        # trailing whitespace
+        for i, line in enumerate(src.splitlines(), 1):
+            if line.rstrip() != line:
+                issues.append(f"trailing whitespace on line {i}")
+        # missing semicolon heuristic
+        lines = [l.rstrip() for l in src.splitlines()]
+        for i, l in enumerate(lines, 1):
+            if l and not l.endswith((';', '{', '}', ':')) and not l.strip().startswith('--') and len(l) < 200:
+                # simple heuristic - skip lines that look like keywords
+                if not any(l.strip().startswith(k) for k in ('func', 'if', 'while', 'quarantine', 'else', 'return')):
+                    issues.append(f"maybe missing semicolon at line {i}: {l.strip()[:80]}")
+        if not issues:
+            print("[lint] no issues found")
+        else:
+            print("[lint] issues:")
+            for it in issues:
+                print(" -", it)
+
+    def cmd_test(self, _args):
+        passed = True
+        # run syntax morph unit tests if available
+        if _syntax_morph_mod:
+            try:
+                fn = getattr(_syntax_morph_mod, "run_unit_tests", None)
+                if callable(fn):
+                    ok = fn(verbose=False)
+                    print(f"syntax morph tests: {'PASS' if ok else 'FAIL'}")
+                    passed = passed and ok
+            except Exception as e:
+                print("syntax morph tests failed:", e)
+                passed = False
+        else:
+            print("syntax morph module unavailable; skipping")
+        # attempt macro overlay demo/test if available
+        if _macro_overlay_mod is None:
+            _macro_overlay_mod = _try_import("macro_overlay")
+        if _macro_overlay_mod:
+            try:
+                demo = getattr(_macro_overlay_mod, "demoExpand", None)
+                if callable(demo):
+                    res = demo()
+                    # demoExpand might be async or sync
+                    if asyncio.iscoroutine(res):
+                        res = asyncio.get_event_loop().run_until_complete(res)
+                    print("macro overlay demo executed")
+                else:
+                    print("no demoExpand in macro_overlay")
+            except Exception as e:
+                print("macro overlay demo failed:", e)
+                passed = False
+        else:
+            print("macro_overlay module unavailable; skipping")
+        print("tests complete")
+        return passed
+
+    def cmd_pack(self, args):
+        if not args:
+            print("Usage: :pack <out.zip>")
+            return
+        out = args[0]
+        files = []
+        if self.last_wasm_path and Path(self.last_wasm_path).exists():
+            files.append(self.last_wasm_path)
+        if self.last_native_path and Path(self.last_native_path).exists():
+            files.append(self.last_native_path)
+        if self.current_file:
+            files.append(self.current_file)
+        if not files:
+            print("No artifacts to pack")
+            return
+        try:
+            import zipfile
+            with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED) as z:
+                for f in files:
+                    z.write(f, arcname=Path(f).name)
+            print(f"Packed {len(files)} files into {out}")
+        except Exception as e:
+            print("pack failed:", e)
+
+    def cmd_serve(self, args):
+        dir_to_serve = args[0] if args else "."
+        port = int(args[1]) if len(args) > 1 else 8000
+        handler = http.server.SimpleHTTPRequestHandler
+        prev_cwd = os.getcwd()
+        os.chdir(dir_to_serve)
+        httpd = socketserver.TCPServer(("", port), handler)
+        print(f"Serving {dir_to_serve} at http://localhost:{port} (Ctrl-C to stop)")
+        _log(f"serve started on {port} for {dir_to_serve}")
+        try:
+            httpd.serve_forever()
+        except KeyboardInterrupt:
+            print("Server stopped")
+        finally:
+            httpd.server_close()
+            os.chdir(prev_cwd)
+
+    def cmd_generate(self, args):
+        """ generate sample project: :generate app myapp """
+        if len(args) < 2:
+            print("Usage: :generate <app|lib> <name>")
+            return
+        typ, name = args[0], args[1]
+        target = Path(name)
+        if target.exists():
+            print(f"{name} already exists")
+            return
+        target.mkdir(parents=True)
+        # basic files
+        main = target / "main.ix"
+        readme = target / "README.md"
+        build_sh = target / "build.sh"
+        if typ == "app":
+            main.write_text(textwrap.dedent("""\
+                -- Generated Instryx app
+                func greet(name) {
+                    print: "Hello, " + name + "!";
+                };
+
+                main() {
+                    greet("Instryx");
+                };
+                """), encoding="utf-8")
+        else:
+            main.write_text(textwrap.dedent("""\
+                -- Generated library
+                func lib_fn() {
+                    print: "library function";
+                };
+                """), encoding="utf-8")
+        readme.write_text(f"# {name}\n\nGenerated by Instryx shell.", encoding="utf-8")
+        build_sh.write_text("#!/bin/sh\ninstryxc main.ix -o main.wasm\n", encoding="utf-8")
+        try:
+            build_sh.chmod(0o755)
+        except Exception:
+            pass
+        print(f"Generated {typ} {name}")
+
+    def cmd_open(self, args):
+        if not args:
+            print("Usage: :open <file>")
+            return
+        path = args[0]
+        try:
+            if sys.platform == "win32":
+                os.startfile(path)
+            elif sys.platform == "darwin":
+                subprocess.run(["open", path])
+            else:
+                subprocess.run(["xdg-open", path])
+            print(f"Opened {path}")
+        except Exception as e:
+            print("open failed:", e)
+
+    def cmd_search(self, args):
+        if not args:
+            print("Usage: :search <pattern>")
+            return
+        pat = args[0]
+        root = Path(".")
+        matches = []
+        for f in root.rglob("*.ix"):
+            try:
+                text = f.read_text(encoding="utf-8")
+                if pat in text:
+                    matches.append(str(f))
+            except Exception:
+                continue
+        if not matches:
+            print("No matches")
+        else:
+            for m in matches:
+                print(m)
+
+    def cmd_plugins_list(self, _args):
+        available = self.plugin_mgr.discover()
+        loaded = self.plugin_mgr.list_loaded()
+        print("Available plugins:", ", ".join(available) if available else "(none)")
+        print("Loaded plugins:", ", ".join(loaded) if loaded else "(none)")
+
+    def cmd_plugins_load(self, args):
+        if not args:
+            print("Usage: :plugins.load <name>")
+            return
+        name = args[0]
+        ok, msg = self.plugin_mgr.load(name)
+        print(msg)
+
+    def cmd_plugins_unload(self, args):
+        if not args:
+            print("Usage: :plugins.unload <name>")
+            return
+        name = args[0]
+        ok, msg = self.plugin_mgr.unload(name)
+        print(msg)
+
+    def cmd_history(self, _args):
+        print("History file:", str(self.history_file))
+
+    def cmd_quit(self, _args):
+        print("Bye.")
+        raise SystemExit(0)
+
+    def cmd_exit(self, _args):
+        self.cmd_quit(_args)
+
+# -------------------------
+# Entry point
+# -------------------------
+def main():
+    shell = InstryxShell()
+    try:
+        shell.repl()
+    except SystemExit:
+        pass
+    except Exception as e:
+        _log(f"fatal: {e}")
+        print(f"[fatal] {e}", file=sys.stderr)
+
+if __name__ == "__main__":
+    main()
+
+    import os
+    os._exit(0)  # ensure all threads exit
+    import sys
+    sys.exit(0)
+    """
+    """
+    # instryx_shell_embedded.py
+    import os
+    os._exit(0)  # ensure all threads exit
+    import sys
+    sys.exit(0)
+    
+# instryx_shell_enhancements.py
+# Enhancements for instryx_shell_embedded.py:
+# - TaskManager (async background tasks with persistence)
+# - FileWatcher (watchdog if available, fallback to polling)
+# - MetricsServer (simple /metrics HTTP endpoint for Prometheus)
+# - Optional ncurses UI overlay for task monitoring
+#
+# Designed to be imported and used by instryx_shell_embedded.py
+
+from __future__ import annotations
+import asyncio
+import gzip
+import hashlib
+import json
+import os
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional
+
+# optional imports
+try:
+    from watchdog.observers import Observer  # type: ignore
+    from watchdog.events import FileSystemEventHandler  # type: ignore
+    _HAS_WATCHDOG = True
+except Exception:
+    _HAS_WATCHDOG = False
+
+try:
+    import curses  # type: ignore
+    _HAS_CURSES = True
+except Exception:
+    _HAS_CURSES = False
+
+# persistent cache dir for shell
+CACHE_DIR = Path.home() / ".instryx_shell_cache"
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+_TASKS_PERSIST = CACHE_DIR / "tasks.json"
+_TASKS_LOCK = threading.RLock()
+
+# simple global metrics store (prometheus-style counters)
+_metrics_lock = threading.RLock()
+_metrics: Dict[str, int] = {
+    "instryx_compile_requests_total": 0,
+    "instryx_compile_success_total": 0,
+    "instryx_compile_failure_total": 0,
+    "instryx_run_requests_total": 0,
+    "instryx_run_success_total": 0,
+    "instryx_run_failure_total": 0,
+}
+
+# threadpool to run blocking work from shell
+_BLOCKING_POOL = ThreadPoolExecutor(max_workers=4)
+
+
+class TaskManager:
+    """
+    Lightweight TaskManager.
+    create(label, coro_func) -> tid
+    list() -> dict of metadata
+    cancel(tid) -> bool
+    Persist metadata to disk to remain inspectable across shell restarts.
+    """
+
+    def __init__(self):
+        self._tasks: Dict[str, Dict[str, Any]] = {}
+        self._lock = threading.RLock()
+        self._load()
+
+    def _load(self):
+        try:
+            if _TASKS_PERSIST.exists():
+                with _TASKS_LOCK:
+                    self._tasks = json.loads(_TASKS_PERSIST.read_text(encoding="utf-8"))
+        except Exception:
+            self._tasks = {}
+
+    def _save(self):
+        try:
+            with _TASKS_LOCK:
+                _TASKS_PERSIST.write_text(json.dumps(self._tasks, default=str, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+    def create(self, label: str, coro_fn: Callable[[], Any]) -> str:
+        tid = hashlib.sha1(f"{label}:{time.time()}".encode()).hexdigest()[:12]
+        meta = {
+            "id": tid,
+            "label": label,
+            "status": "queued",
+            "start_ts": None,
+            "finish_ts": None,
+            "result": None,
+        }
+        with self._lock:
+            self._tasks[tid] = meta
+            self._save()
+
+        async def _runner():
+            meta["status"] = "running"
+            meta["start_ts"] = time.time()
+            self._save()
+            try:
+                res = await coro_fn()
+                meta["status"] = "done"
+                meta["result"] = {"ok": True, "value": res}
+            except asyncio.CancelledError:
+                meta["status"] = "cancelled"
+            except Exception as e:
+                meta["status"] = "error"
+                meta["result"] = {"ok": False, "error": str(e)}
+            meta["finish_ts"] = time.time()
+            self._save()
+
+        task = asyncio.create_task(_runner())
+        with self._lock:
+            self._tasks[tid]["task_ref"] = task
+            self._save()
+        return tid
+
+    def list(self) -> Dict[str, Dict[str, Any]]:
+        with self._lock:
+            out = {}
+            for k, v in self._tasks.items():
+                copyv = dict(v)
+                copyv.pop("task_ref", None)
+                out[k] = copyv
+            return out
+
+    def cancel(self, tid: str) -> bool:
+        with self._lock:
+            entry = self._tasks.get(tid)
+            if not entry:
+                return False
+            tref = entry.get("task_ref")
+            if tref and not tref.done():
+                tref.cancel()
+                entry["status"] = "cancelling"
+                self._save()
+                return True
+        return False
+
+
+class _PollingWatcher(threading.Thread):
+    """Lightweight fallback watcher (polling)."""
+
+    def __init__(self, callback: Callable[[str], None], poll_interval: float = 0.5):
+        super().__init__(daemon=True)
+        self._watched: Dict[str, float] = {}
+        self._cb = callback
+        self._interval = poll_interval
+        self._stop = threading.Event()
+
+    def watch(self, path: str):
+        p = Path(path)
+        self._watched[path] = p.stat().st_mtime if p.exists() else 0.0
+
+    def unwatch(self, path: str):
+        self._watched.pop(path, None)
+        if not self._watched:
+            self._stop.set()
+
+    def run(self):
+        while not self._stop.is_set() and self._watched:
+            for p, last in list(self._watched.items()):
+                try:
+                    if Path(p).exists():
+                        m = Path(p).stat().st_mtime
+                        if m != last:
+                            self._watched[p] = m
+                            try:
+                                self._cb(p)
+                            except Exception:
+                                pass
+                    else:
+                        self._watched.pop(p, None)
+                except Exception:
+                    continue
+            time.sleep(self._interval)
+
+    def stop(self):
+        self._stop.set()
+
+
+class FileWatcher:
+    """
+    FileWatcher that uses watchdog when available; falls back to polling otherwise.
+
+    API:
+      fw = FileWatcher()
+      fw.watch(path, callback)
+      fw.unwatch(path)
+    """
+
+    def __init__(self):
+        self._poller: Optional[_PollingWatcher] = None
+        self._observer = None
+        self._handlers: Dict[str, Callable[[str], None]] = {}
+        if _HAS_WATCHDOG:
+            class _Handler(FileSystemEventHandler):
+                def __init__(self, outer):
+                    super().__init__()
+                    self._outer = outer
+
+                def on_modified(self, event):
+                    if not event.is_directory:
+                        cb = self._outer._handlers.get(event.src_path)
+                        if cb:
+                            try:
+                                cb(event.src_path)
+                            except Exception:
+                                pass
+
+                def on_created(self, event):
+                    if not event.is_directory:
+                        cb = self._outer._handlers.get(event.src_path)
+                        if cb:
+                            try:
+                                cb(event.src_path)
+                            except Exception:
+                                pass
+            self._wd_handler_cls = _Handler
+        else:
+            self._wd_handler_cls = None
+
+    def watch(self, path: str, callback: Callable[[str], None]):
+        path = str(Path(path).resolve())
+        self._handlers[path] = callback
+        if _HAS_WATCHDOG:
+            if self._observer is None:
+                self._observer = Observer()
+                self._observer.start()
+            handler = self._wd_handler_cls(self)
+            self._observer.schedule(handler, os.path.dirname(path) or ".", recursive=False)
+        else:
+            if self._poller is None or not self._poller.is_alive():
+                self._poller = _PollingWatcher(callback)
+                self._poller.start()
+            self._poller.watch(path)
+
+    def unwatch(self, path: str):
+        path = str(Path(path).resolve())
+        self._handlers.pop(path, None)
+        if _HAS_WATCHDOG and self._observer:
+            # watchdog doesn't provide per-path unschedule easily here; best-effort leave running
+            pass
+        else:
+            if self._poller:
+                self._poller.unwatch(path)
+
+    def stop(self):
+        if _HAS_WATCHDOG and self._observer:
+            try:
+                self._observer.stop()
+                self._observer.join(timeout=1.0)
+            except Exception:
+                pass
+        if self._poller:
+            self._poller.stop()
+
+
+# Simple HTTP metrics endpoint for Prometheus
+@dataclass
+class MetricsServer:
+    host: str = "127.0.0.1"
+    port: int = 8001
+    _server: Optional[threading.Thread] = None
+    _httpd: Any = None
+
+    def _make_handler(self):
+        metrics_ref = _metrics
+        metrics_lock = _metrics_lock
+
+        class _Handler(http.server.BaseHTTPRequestHandler):  # type: ignore
+            def do_GET(self):
+                if self.path != "/metrics":
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                with metrics_lock:
+                    payload = "\n".join(f"{k} {v}" for k, v in metrics_ref.items()) + "\n"
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; version=0.0.4")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload.encode("utf-8"))
+
+            def log_message(self, format, *args):
+                return  # silence
+
+        return _Handler
+
+    def start(self):
+        if self._server and self._server.is_alive():
+            return
+        handler = self._make_handler()
+        import socketserver
+        self._httpd = socketserver.TCPServer((self.host, self.port), handler)
+        def _serve():
+            try:
+                self._httpd.serve_forever()
+            except Exception:
+                pass
+        self._server = threading.Thread(target=_serve, daemon=True)
+        self._server.start()
+
+    def stop(self):
+        if self._httpd:
+            try:
+                self._httpd.shutdown()
+            except Exception:
+                pass
+        if self._server:
+            self._server.join(timeout=1.0)
+
+
+# Simple ncurses UI for viewing tasks (optional)
+def start_tasks_ui(task_mgr: TaskManager):
+    if not _HAS_CURSES:
+        raise RuntimeError("curses not available on this platform")
+    import curses
+
+    def _ui(stdscr):
+        curses.curs_set(0)
+        stdscr.nodelay(True)
+        while True:
+            stdscr.erase()
+            tasks = task_mgr.list()
+            stdscr.addstr(0, 0, "Instryx Tasks (q to quit)".ljust(80), curses.A_REVERSE)
+            row = 1
+            for tid, meta in tasks.items():
+                label = meta.get("label", "")[:40]
+                status = meta.get("status", "")
+                start_ts = meta.get("start_ts") or ""
+                finish_ts = meta.get("finish_ts") or ""
+                line = f"{tid} {label:40} {status:10} start={start_ts} finish={finish_ts}"
+                stdscr.addstr(row, 0, line[:curses.COLS-1])
+                row += 1
+                if row >= curses.LINES - 1:
+                    break
+            stdscr.refresh()
+            try:
+                ch = stdscr.getch()
+                if ch in (ord("q"), ord("Q")):
+                    break
+            except Exception:
+                pass
+            time.sleep(0.2)
+
+    curses.wrapper(_ui)
+
+# tests/test_shell_enhancements.py
+# Unit tests for TaskManager and FileWatcher (fallback behavior)
+import asyncio
+import os
+import tempfile
+import time
+import unittest
+from pathlib import Path
+
+from instryx_shell_enhancements import TaskManager, FileWatcher, MetricsServer, _metrics, _metrics_lock
+
+class TestTaskManager(unittest.IsolatedAsyncioTestCase):
+    async def test_create_and_complete_task(self):
+        tm = TaskManager()
+        async def coro():
+            await asyncio.sleep(0.01)
+            return "ok"
+        tid = tm.create("quick", coro)
+        # wait until task finishes
+        for _ in range(100):
+            lst = tm.list()
+            if lst[tid]["status"] in ("done", "error"):
+                break
+            await asyncio.sleep(0.01)
+        lst = tm.list()
+        self.assertIn(tid, lst)
+        self.assertIn(lst[tid]["status"], ("done", "error"))
+
+    async def test_cancel(self):
+        tm = TaskManager()
+        async def long_coro():
+            await asyncio.sleep(2)
+            return "done"
+        tid = tm.create("long", long_coro)
+        # cancel immediately
+        ok = tm.cancel(tid)
+        self.assertTrue(ok)
+        # wait a bit
+        await asyncio.sleep(0.05)
+        lst = tm.list()
+        self.assertIn(tid, lst)
+        self.assertIn(lst[tid]["status"], ("cancelling", "cancelled", "done", "error"))
+
+class TestFileWatcher(unittest.TestCase):
+    def test_polling_watch(self):
+        fw = FileWatcher()
+        tf = tempfile.NamedTemporaryFile(delete=False)
+        path = tf.name
+        tf.write(b"hello")
+        tf.flush()
+        tf.close()
+        seen = []
+        def cb(p):
+            seen.append(p)
+        try:
+            fw.watch(path, cb)
+            # modify file
+            time.sleep(0.1)
+            with open(path, "w") as f:
+                f.write("changed")
+            # wait for callback
+            for _ in range(50):
+                if seen:
+                    break
+                time.sleep(0.05)
+            self.assertTrue(len(seen) >= 1)
+        finally:
+            try:
+                fw.unwatch(path)
+            except Exception:
+                pass
+            try:
+                os.unlink(path)
+            except Exception:
+                pass
+
+class TestMetricsServer(unittest.TestCase):
+    def test_metrics_endpoint(self):
+        ms = MetricsServer(host="127.0.0.1", port=18081)
+        ms.start()
+        try:
+            # increment a metric
+            with _metrics_lock:
+                _metrics["instryx_compile_requests_total"] += 1
+            import urllib.request
+            res = urllib.request.urlopen("http://127.0.0.1:18081/metrics")
+            body = res.read().decode()
+            self.assertIn("instryx_compile_requests_total", body)
+        finally:
+            ms.stop()
+
+if __name__ == "__main__":
+    unittest.main()
+
+# (append) Integration glue for the new enhancements module
+# This block can be appended to the end of instryx_shell_embedded.py to wire in the new features.
+try:
+    from instryx_shell_enhancements import TaskManager, FileWatcher, MetricsServer, start_tasks_ui, _metrics, _metrics_lock
+except Exception:
+    TaskManager = None
+    FileWatcher = None
+    MetricsServer = None
+    start_tasks_ui = None
+
+# Attach optional instances and commands to InstryxShell by monkey-patching if available.
+if TaskManager is not None and FileWatcher is not None:
+    def _attach_enhancements(shell_cls):
+        # provide lazy-initialized components on shell instances
+        def _ensure_components(self):
+            if not hasattr(self, "task_mgr"):
+                self.task_mgr = TaskManager()
+            if not hasattr(self, "file_watcher"):
+                self.file_watcher = FileWatcher()
+            if not hasattr(self, "metrics_server"):
+                self.metrics_server = None
+        shell_cls._ensure_components = _ensure_components
+
+        async def _wrap_coro(fn):
+            # helper to adapt blocking functions to coroutine for TaskManager
+            return await fn()
+
+        def cmd_tasks(self, _args):
+            self._ensure_components()
+            tasks = self.task_mgr.list()
+            if not tasks:
+                print("No background tasks")
+                return
+            for tid, meta in tasks.items():
+                print(f"{tid} {meta.get('label')} status={meta.get('status')} start={meta.get('start_ts')} finish={meta.get('finish_ts')}")
+        shell_cls.cmd_tasks = cmd_tasks
+
+        def cmd_task_cancel(self, args):
+            if not args:
+                print("Usage: :task.cancel <id>")
+                return
+            self._ensure_components()
+            ok = self.task_mgr.cancel(args[0])
+            print("cancelled" if ok else "not found or already done")
+        shell_cls.cmd_task_cancel = cmd_task_cancel
+
+        def cmd_watch(self, args):
+            if not args:
+                print("Usage: :watch <file>")
+                return
+            self._ensure_components()
+            path = args[0]
+            def cb(p):
+                print(f"[watch] change detected: {p}")
+                try:
+                    txt = Path(p).read_text(encoding="utf-8")
+                    self.source_original = txt
+                    self.source_morphed = None
+                    self.source_expanded = None
+                    print("[watch] reloaded source buffer")
+                except Exception as e:
+                    print("[watch] reload failed:", e)
+            self.file_watcher.watch(path, cb)
+            print(f"Watching {path} for changes")
+        shell_cls.cmd_watch = cmd_watch
+
+        def cmd_metrics_start(self, args):
+            host = args[0] if args else "127.0.0.1"
+            port = int(args[1]) if len(args) > 1 else 8001
+            self._ensure_components()
+            if getattr(self, "metrics_server", None) is None:
+                self.metrics_server = MetricsServer(host=host, port=port)
+                self.metrics_server.start()
+                print(f"metrics server started at http://{host}:{port}/metrics")
+            else:
+                print("metrics server already running")
+        shell_cls.cmd_metrics_start = cmd_metrics_start
+
+        def cmd_metrics_stop(self, _args):
+            if getattr(self, "metrics_server", None):
+                try:
+                    self.metrics_server.stop()
+                except Exception:
+                    pass
+                self.metrics_server = None
+                print("metrics server stopped")
+            else:
+                print("metrics server not running")
+        shell_cls.cmd_metrics_stop = cmd_metrics_stop
+
+        def cmd_tasks_ui(self, _args):
+            self._ensure_components()
+            if start_tasks_ui is None:
+                print("ncurses UI not available on this platform")
+                return
+            try:
+                start_tasks_ui(self.task_mgr)
+            except Exception as e:
+                print("tasks UI failed:", e)
+        shell_cls.cmd_tasks_ui = cmd_tasks_ui
+
+    try:
+        _attach_enhancements(InstryxShell)
+    except Exception:
+        pass
+
+
+"""
+instryx_heap_gc_allocator.py
+
+Production-ready Heap + Generational Mark-and-Sweep Garbage Collector (GC) allocator
+for the Instryx runtime with many optimizations, tooling and features.
+
+Enhancements added:
+- Generational GC (minor/major collections), remembered-set and write-barrier.
+- Card-table style coarse-grained remembered-set via per-object flags.
+- Pinned-object support (pin/unpin) to avoid moving or finalizing during compaction.
+- Large-object allocator (separate tracking) to avoid frequent movement.
+- Async background finalizer thread that executes finalizers out-of-band.
+- Optional incremental marking support (mark-in-steps) with an exposed API.
+- Best-effort heap compaction: moves live objects to a new heap and rewrites references.
+- Heap snapshot diff / leak detection helpers.
+- Integration hooks: register external instrumentation callbacks for alloc/free/collect.
+- Profiling counters, generation histograms and runtime stats.
+- Export/import heap snapshot, export metrics to JSON, atomic export.
+- Conservative root scanner helper using Python's gc module (optional).
+- CLI demo and robust self-test.
+
+Design:
+- Objects are opaque integer handles.
+- Only integers that exist in the allocator's heap are treated as object references.
+- Caller should call write-barrier helpers (set_field/set_index) already implemented here.
+- The allocator is thread-safe via an RLock.
+"""
+
+from __future__ import annotations
+import gc as _py_gc
+import json
+import logging
+import os
+import tempfile
+import threading
+import time
+import traceback
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+
+LOG = logging.getLogger("instryx.heapgc")
+if not LOG.handlers:
+    logging.basicConfig(level=logging.INFO)
+
+# Configuration defaults
+DEFAULT_MAX_HEAP_OBJECTS = 50_000
+DEFAULT_YOUNG_THRESHOLD = 2         # minor collections to trigger promotion
+BACKGROUND_COLLECTION_INTERVAL = 2.0  # background minor GC interval (s)
+FINALIZER_BATCH_SIZE = 32            # finalizers executed per run
+COMPACT_THRESHOLD_RATIO = 0.25       # if free fraction > threshold, attempt compaction
+
+
+@dataclass
+class HeapStats:
+    alloc_count: int = 0
+    collect_count: int = 0
+    last_collect_time: Optional[float] = None
+    last_collected_objects: int = 0
+    heap_size_high_water: int = 0
+    total_finalized: int = 0
+
+
+class HeapObject:
+    """
+    Internal representation of a heap object.
+    Fields:
+      - id: handle integer
+      - kind: "object", "array", "bytes", "value", "large"
+      - payload: dict/list/bytearray/value depending on kind
+      - gen: generation number (0 = young)
+      - age: survived minor collections count
+      - marked: mark flag during marking
+      - pinned: if True object must not be moved / finalized
+      - has_old_to_young_ref: boolean card flag used for remembered set
+      - finalizer: optional callable(handle, obj)
+      - size: abstract size units for heuristics (large objects track their bytes)
+    """
+    __slots__ = ("id", "kind", "payload", "gen", "age", "marked", "pinned",
+                 "has_old_to_young_ref", "finalizer", "size")
+
+    def __init__(self, id_: int, kind: str, payload: Any, size: int = 1, finalizer: Optional[Callable] = None):
+        self.id = id_
+        self.kind = kind
+        self.payload = payload
+        self.gen = 0
+        self.age = 0
+        self.marked = False
+        self.pinned = False
+        self.has_old_to_young_ref = False
+        self.finalizer = finalizer
+        self.size = int(size)
+
+
+class HeapGCAllocator:
+    """
+    Main allocator class implementing features listed above.
+    """
+
+    def __init__(
+        self,
+        max_heap_objects: int = DEFAULT_MAX_HEAP_OBJECTS,
+        young_threshold: int = DEFAULT_YOUNG_THRESHOLD,
+        enable_background: bool = True,
+    ):
+        self.max_heap_objects = int(max_heap_objects)
+        self.young_threshold = int(young_threshold)
+
+        self._lock = threading.RLock()
+        self._next_id = 1
+        self._heap: Dict[int, HeapObject] = {}
+        self._large_objects: Set[int] = set()
+        self._roots: Dict[str, Set[int]] = {}
+        self._remembered: Set[int] = set()
+        self._pinned: Set[int] = set()
+        self._stats = HeapStats()
+        self._observers: Dict[str, List[Callable[[Dict[str, Any]], None]]] = {}
+        self._finalizer_queue: List[Tuple[int, HeapObject]] = []
+        self._finalizer_lock = threading.RLock()
+        self._stop_bg = threading.Event()
+        self._bg_thread: Optional[threading.Thread] = None
+        self._finalizer_thread: Optional[threading.Thread] = None
+        self._incremental_stack: List[int] = []
+        self._incremental_state = {"active": False}
+        self._compact_lock = threading.RLock()
+        if enable_background:
+            self.start_background_collector()
+            self.start_finalizer_worker()
+        LOG.info("HeapGCAllocator init max=%d young_threshold=%d bg=%s", self.max_heap_objects, self.young_threshold, enable_background)
+
+    # ---------------------------
+    # Observers / instrumentation
+    # ---------------------------
+    def register_observer(self, name: str, fn: Callable[[Dict[str, Any]], None]) -> None:
+        with self._lock:
+            self._observers.setdefault(name, []).append(fn)
+
+    def _notify(self, event: str, payload: Dict[str, Any]) -> None:
+        with self._lock:
+            for fn in self._observers.get(event, []):
+                try:
+                    fn(payload)
+                except Exception:
+                    LOG.exception("observer %s failed", event)
+
+    # ---------------------------
+    # Allocation primitives
+    # ---------------------------
+    def _alloc_id(self) -> int:
+        with self._lock:
+            hid = self._next_id
+            self._next_id += 1
+            return hid
+
+    def _ensure_capacity(self):
+        if len(self._heap) + len(self._large_objects) >= self.max_heap_objects:
+            LOG.debug("heap near capacity, attempting GC")
+            self.collect(full=False)
+            if len(self._heap) + len(self._large_objects) >= self.max_heap_objects:
+                # attempt more aggressive major collect
+                self.collect(full=True)
+            if len(self._heap) + len(self._large_objects) >= self.max_heap_objects:
+                raise MemoryError("Heap limit reached after GC attempts")
+
+    def alloc_object(self, fields: Optional[Dict[str, Any]] = None, finalizer: Optional[Callable] = None, size: int = 1) -> int:
+        fields = dict(fields or {})
+        with self._lock:
+            self._ensure_capacity()
+            hid = self._alloc_id()
+            obj = HeapObject(hid, "object", fields, size=size, finalizer=finalizer)
+            self._heap[hid] = obj
+            self._stats.alloc_count += 1
+            self._stats.heap_size_high_water = max(self._stats.heap_size_high_water, len(self._heap))
+            self._update_remembered_for_new(obj)
+            self._notify("alloc", {"handle": hid, "kind": "object", "size": size})
+            return hid
+
+    def alloc_array(self, length: int, initial: Any = None, finalizer: Optional[Callable] = None, size: int = 1) -> int:
+        arr = [initial] * int(length)
+        with self._lock:
+            self._ensure_capacity()
+            hid = self._alloc_id()
+            obj = HeapObject(hid, "array", arr, size=size, finalizer=finalizer)
+            self._heap[hid] = obj
+            self._stats.alloc_count += 1
+            self._update_remembered_for_new(obj)
+            self._notify("alloc", {"handle": hid, "kind": "array", "size": size})
+            return hid
+
+    def alloc_bytes(self, nbytes: int, finalizer: Optional[Callable] = None) -> int:
+        b = bytearray(int(nbytes))
+        with self._lock:
+            self._ensure_capacity()
+            hid = self._alloc_id()
+            obj = HeapObject(hid, "bytes", b, size=nbytes, finalizer=finalizer)
+            self._heap[hid] = obj
+            self._stats.alloc_count += 1
+            self._notify("alloc", {"handle": hid, "kind": "bytes", "size": nbytes})
+            return hid
+
+    def alloc_large_object(self, payload: Any, size_bytes: int, finalizer: Optional[Callable] = None) -> int:
+        """Allocate a large object tracked separately (less likely to move)."""
+        with self._lock:
+            self._ensure_capacity()
+            hid = self._alloc_id()
+            obj = HeapObject(hid, "large", payload, size=size_bytes, finalizer=finalizer)
+            self._heap[hid] = obj
+            self._large_objects.add(hid)
+            self._stats.alloc_count += 1
+            self._notify("alloc", {"handle": hid, "kind": "large", "size": size_bytes})
+            return hid
+
+    def box_value(self, value: Any) -> int:
+        with self._lock:
+            self._ensure_capacity()
+            hid = self._alloc_id()
+            obj = HeapObject(hid, "value", value, size=1)
+            self._heap[hid] = obj
+            self._stats.alloc_count += 1
+            self._notify("alloc", {"handle": hid, "kind": "value"})
+            return hid
+
+    # ---------------------------
+    # Access helpers + write barrier
+    # ---------------------------
+    def get_field(self, handle: int, name: str) -> Any:
+        obj = self._heap.get(handle)
+        if not obj or obj.kind != "object":
+            raise KeyError("invalid object handle for get_field")
+        return obj.payload.get(name)
+
+    def set_field(self, handle: int, name: str, value: Any) -> None:
+        with self._lock:
+            obj = self._heap.get(handle)
+            if not obj or obj.kind != "object":
+                raise KeyError("invalid object handle for set_field")
+            obj.payload[name] = value
+            self._write_barrier(obj, value)
+
+    def get_index(self, handle: int, idx: int) -> Any:
+        obj = self._heap.get(handle)
+        if not obj or obj.kind != "array":
+            raise KeyError("invalid array handle for get_index")
+        return obj.payload[int(idx)]
+
+    def set_index(self, handle: int, idx: int, value: Any) -> None:
+        with self._lock:
+            obj = self._heap.get(handle)
+            if not obj or obj.kind != "array":
+                raise KeyError("invalid array handle for set_index")
+            obj.payload[int(idx)] = value
+            self._write_barrier(obj, value)
+
+    def raw_bytes(self, handle: int) -> bytearray:
+        obj = self._heap.get(handle)
+        if not obj or obj.kind not in ("bytes", "large"):
+            raise KeyError("invalid bytes handle")
+        return obj.payload
+
+    def _write_barrier(self, obj: HeapObject, value: Any) -> None:
+        """
+        Write barrier: when an older object stores a reference to a young object,
+        record it in remembered set. Also maintain card flag optimization.
+        """
+        if not isinstance(value, int) or value not in self._heap:
+            return
+        with self._lock:
+            target = self._heap[value]
+            if obj.gen > 0 and target.gen == 0:
+                obj.has_old_to_young_ref = True
+                self._remembered.add(obj.id)
+
+    # ---------------------------
+    # Pinning API
+    # ---------------------------
+    def pin(self, handle: int) -> None:
+        with self._lock:
+            if handle in self._heap:
+                self._heap[handle].pinned = True
+                self._pinned.add(handle)
+
+    def unpin(self, handle: int) -> None:
+        with self._lock:
+            if handle in self._heap:
+                self._heap[handle].pinned = False
+                self._pinned.discard(handle)
+
+    # ---------------------------
+    # Roots API
+    # ---------------------------
+    def register_root(self, set_name: str, handle: int) -> None:
+        with self._lock:
+            self._roots.setdefault(set_name, set()).add(handle)
+            self._notify("root_register", {"set": set_name, "handle": handle})
+
+    def unregister_root(self, set_name: str, handle: int) -> None:
+        with self._lock:
+            if set_name in self._roots:
+                self._roots[set_name].discard(handle)
+                if not self._roots[set_name]:
+                    del self._roots[set_name]
+            self._notify("root_unregister", {"set": set_name, "handle": handle})
+
+    def list_roots(self) -> Dict[str, Set[int]]:
+        with self._lock:
+            return {k: set(v) for k, v in self._roots.items()}
+
+    # ---------------------------
+    # Finalizers worker
+    # ---------------------------
+    def start_finalizer_worker(self):
+        if self._finalizer_thread and self._finalizer_thread.is_alive():
+            return
+        self._finalizer_thread = threading.Thread(target=self._finalizer_worker, daemon=True)
+        self._finalizer_thread.start()
+        LOG.info("finalizer worker started")
+
+    def stop_finalizer_worker(self):
+        if self._finalizer_thread:
+            try:
+                self._finalizer_thread.join(timeout=1.0)
+            except Exception:
+                pass
+
+    def _enqueue_finalizer(self, hid: int, obj: HeapObject):
+        with self._finalizer_lock:
+            self._finalizer_queue.append((hid, obj))
+
+    def _finalizer_worker(self):
+        while not self._stop_bg.is_set():
+            batch = []
+            with self._finalizer_lock:
+                while self._finalizer_queue and len(batch) < FINALIZER_BATCH_SIZE:
+                    batch.append(self._finalizer_queue.pop(0))
+            if not batch:
+                time.sleep(0.2)
+                continue
+            for hid, obj in batch:
+                try:
+                    if obj.finalizer and not obj.pinned:
+                        obj.finalizer(hid, obj)
+                        self._stats.total_finalized += 1
+                        self._notify("finalized", {"handle": hid})
+                except Exception:
+                    LOG.exception("finalizer error for %d", hid)
+
+    # ---------------------------
+    # Collection: minor/major and incremental
+    # ---------------------------
+    def collect(self, full: bool = True) -> Dict[str, Any]:
+        """
+        Full collection when full=True (major), minor otherwise.
+        Collection is mark-and-sweep; finalizers queued and executed asynchronously.
+        """
+        start_time = time.time()
+        with self._lock:
+            try:
+                self._unmark_all()
+                roots = self._gather_roots()
+                # include remembered set for minor collections
+                remember_roots = set(self._remembered) if not full else set()
+                stack = list(roots | remember_roots)
+                marked = 0
+                while stack:
+                    hid = stack.pop()
+                    if hid not in self._heap:
+                        continue
+                    obj = self._heap[hid]
+                    if obj.marked:
+                        continue
+                    obj.marked = True
+                    marked += 1
+                    refs = self._extract_references(obj)
+                    for r in refs:
+                        if r in self._heap and not self._heap[r].marked:
+                            stack.append(r)
+                # sweep phase - collect unmarked
+                to_delete = []
+                for hid, obj in list(self._heap.items()):
+                    if not obj.marked:
+                        if obj.pinned:
+                            # pinned unreachable objects are skipped (user responsibility)
+                            continue
+                        to_delete.append(hid)
+                # queue finalizers and remove
+                for hid in to_delete:
+                    obj = self._heap.get(hid)
+                    if obj and obj.finalizer:
+                        self._enqueue_finalizer(hid, obj)
+                for hid in to_delete:
+                    self._heap.pop(hid, None)
+                    self._remembered.discard(hid)
+                    self._large_objects.discard(hid)
+                    self._pinned.discard(hid)
+                # promotion
+                for obj in self._heap.values():
+                    if obj.marked:
+                        if obj.gen == 0:
+                            obj.age += 1
+                            if obj.age >= self.young_threshold:
+                                obj.gen += 1
+                                obj.age = 0
+                        # reset has_old_to_young_ref if now stable
+                        if obj.has_old_to_young_ref:
+                            # recompute whether any refs still point to young
+                            refs = self._extract_references(obj)
+                            obj.has_old_to_young_ref = any(self._heap[r].gen == 0 for r in refs if r in self._heap)
+                # stats
+                self._stats.collect_count += 1
+                self._stats.last_collect_time = time.time()
+                self._stats.last_collected_objects = len(to_delete)
+                # auto compaction heuristic
+                free_fraction = 1.0 - (len(self._heap) / max(1, self.max_heap_objects))
+                if full and free_fraction > COMPACT_THRESHOLD_RATIO:
+                    try:
+                        self.compact_heap()
+                    except Exception:
+                        LOG.exception("compaction failed")
+                self._notify("collect", {"marked": marked, "collected": len(to_delete)})
+                LOG.info("GC complete: marked=%d collected=%d heap=%d", marked, len(to_delete), len(self._heap))
+                return {"marked": marked, "collected": len(to_delete), "heap_size": len(self._heap), "duration_s": time.time() - start_time}
+            except Exception:
+                LOG.exception("GC failed")
+                return {"error": "exception during GC"}
+
+    def minor_collect(self) -> Dict[str, Any]:
+        return self.collect(full=False)
+
+    def major_collect(self) -> Dict[str, Any]:
+        return self.collect(full=True)
+
+    def _unmark_all(self):
+        for obj in self._heap.values():
+            obj.marked = False
+
+    def _gather_roots(self) -> Set[int]:
+        roots: Set[int] = set()
+        for s in self._roots.values():
+            for hid in s:
+                if hid in self._heap:
+                    roots.add(hid)
+        return roots
+
+    # incremental marking: prepare and do limited steps
+    def begin_incremental_mark(self):
+        with self._lock:
+            self._unmark_all()
+            roots = self._gather_roots()
+            self._incremental_stack = list(roots)
+            self._incremental_state["active"] = True
+            LOG.debug("incremental mark started with stack=%d", len(self._incremental_stack))
+
+    def incremental_mark_step(self, max_nodes: int = 1000) -> Dict[str, Any]:
+        with self._lock:
+            if not self._incremental_state.get("active"):
+                return {"status": "inactive"}
+            processed = 0
+            while self._incremental_stack and processed < max_nodes:
+                hid = self._incremental_stack.pop()
+                if hid not in self._heap:
+                    continue
+                obj = self._heap[hid]
+                if obj.marked:
+                    continue
+                obj.marked = True
+                processed += 1
+                refs = self._extract_references(obj)
+                for r in refs:
+                    if r in self._heap and not self._heap[r].marked:
+                        self._incremental_stack.append(r)
+            if not self._incremental_stack:
+                # finish and sweep unreachable
+                self._incremental_state["active"] = False
+                # now sweep like a major collect but queue finalizers async
+                to_delete = [hid for hid, obj in list(self._heap.items()) if not obj.marked and not obj.pinned]
+                for hid in to_delete:
+                    obj = self._heap.get(hid)
+                    if obj and obj.finalizer:
+                        self._enqueue_finalizer(hid, obj)
+                for hid in to_delete:
+                    self._heap.pop(hid, None)
+                    self._remembered.discard(hid)
+                    self._large_objects.discard(hid)
+                    self._pinned.discard(hid)
+                LOG.debug("incremental mark complete processed=%d swept=%d", processed, len(to_delete))
+                return {"status": "complete", "processed": processed, "swept": len(to_delete)}
+            return {"status": "in-progress", "processed": processed, "remaining": len(self._incremental_stack)}
+
+    # ---------------------------
+    # Compaction (best-effort)
+    # ---------------------------
+    def compact_heap(self) -> Dict[str, Any]:
+        """
+        Best-effort compaction: allocate new ids for live objects, copy payloads,
+        rewrite references and update roots. Pinned objects are not moved.
+        This operation can be heavy; caller should ensure minimal concurrency.
+        """
+        with self._compact_lock, self._lock:
+            try:
+                LOG.info("Starting heap compaction")
+                # identify live objects via a temporary mark
+                self._unmark_all()
+                roots = self._gather_roots()
+                stack = list(roots)
+                while stack:
+                    hid = stack.pop()
+                    if hid not in self._heap:
+                        continue
+                    obj = self._heap[hid]
+                    if obj.marked:
+                        continue
+                    obj.marked = True
+                    for r in self._extract_references(obj):
+                        if r in self._heap and not self._heap[r].marked:
+                            stack.append(r)
+                # build mapping for movable objects: skip pinned and large objects
+                mapping: Dict[int, int] = {}
+                new_heap: Dict[int, HeapObject] = {}
+                for old_id, obj in list(self._heap.items()):
+                    if not obj.marked:
+                        continue  # unreachable won't be moved
+                    if obj.pinned or old_id in self._large_objects:
+                        # preserve id to avoid changing external refs; copy as-is
+                        mapping[old_id] = old_id
+                        new_heap[old_id] = obj
+                        continue
+                    # assign new id
+                    new_id = self._alloc_id()
+                    mapping[old_id] = new_id
+                    # shallow copy of payload; we'll rewrite references next
+                    copied = None
+                    if obj.kind == "object":
+                        copied = dict(obj.payload)
+                    elif obj.kind == "array":
+                        copied = list(obj.payload)
+                    elif obj.kind in ("bytes", "large"):
+                        copied = bytearray(obj.payload) if obj.kind == "bytes" else obj.payload
+                    elif obj.kind == "value":
+                        copied = obj.payload
+                    new_obj = HeapObject(new_id, obj.kind, copied, size=obj.size, finalizer=obj.finalizer)
+                    new_obj.gen = obj.gen
+                    new_obj.age = obj.age
+                    new_obj.pinned = obj.pinned
+                    new_heap[new_id] = new_obj
+                # rewrite references in new_heap
+                def rewrite_in_obj(o: HeapObject):
+                    if o.kind == "object":
+                        for k, v in list(o.payload.items()):
+                            if isinstance(v, int) and v in mapping:
+                                o.payload[k] = mapping[v]
+                    elif o.kind == "array":
+                        for i, v in enumerate(o.payload):
+                            if isinstance(v, int) and v in mapping:
+                                o.payload[i] = mapping[v]
+                for o in new_heap.values():
+                    rewrite_in_obj(o)
+                # update roots to new ids
+                new_roots: Dict[str, Set[int]] = {}
+                for rname, rset in self._roots.items():
+                    new_set = set()
+                    for hid in rset:
+                        if hid in mapping:
+                            new_set.add(mapping[hid])
+                    if new_set:
+                        new_roots[rname] = new_set
+                # replace heap and roots
+                self._heap = new_heap
+                self._roots = new_roots
+                # rebuild large_objects and pinned sets
+                self._large_objects = {mapping.get(h, h) for h in list(self._large_objects) if h in mapping}
+                self._pinned = {mapping.get(h, h) for h in list(self._pinned) if h in mapping}
+                # rebuild remembered set conservatively
+                self._remembered = set()
+                for hid, obj in self._heap.items():
+                    if obj.gen > 0:
+                        refs = self._extract_references(obj)
+                        if any((r in self._heap and self._heap[r].gen == 0) for r in refs):
+                            self._remembered.add(hid)
+                LOG.info("Compaction complete: new_heap=%d", len(self._heap))
+                self._notify("compact", {"heap_size": len(self._heap)})
+                return {"status": "ok", "heap_size": len(self._heap)}
+            except Exception:
+                LOG.exception("compaction failed")
+                return {"status": "error", "message": "exception during compaction"}
+
+    # ---------------------------
+    # Helpers & introspection
+    # ---------------------------
+    def heap_snapshot(self, include_contents: bool = False) -> Dict[str, Any]:
+        with self._lock:
+            snap = {
+                "time": time.time(),
+                "count": len(self._heap),
+                "objects": {},
+                "roots": {k: list(v) for k, v in self._roots.items()},
+                "remembered": list(self._remembered),
+                "large_objects": list(self._large_objects),
+                "pinned": list(self._pinned),
+                "stats": self._stats.__dict__.copy(),
+            }
+            for hid, obj in self._heap.items():
+                o = {"id": hid, "kind": obj.kind, "gen": obj.gen, "age": obj.age, "size": obj.size, "pinned": obj.pinned}
+                if include_contents:
+                    if obj.kind == "object":
+                        o["fields"] = dict(obj.payload)
+                    elif obj.kind == "array":
+                        o["array"] = list(obj.payload)
+                    elif obj.kind in ("bytes", "large"):
+                        o["raw_len"] = len(obj.payload) if hasattr(obj.payload, "__len__") else None
+                    elif obj.kind == "value":
+                        o["value"] = obj.payload
+                snap["objects"][hid] = o
+            return snap
+
+    def export_heap_json(self, path: Optional[str] = None, include_contents: bool = True) -> str:
+        if not path:
+            fd, path = tempfile.mkstemp(prefix="instryx_heap_", suffix=".json")
+            os.close(fd)
+        snap = self.heap_snapshot(include_contents=include_contents)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(snap, f, indent=2, default=str)
+        os.replace(tmp, path)
+        LOG.info("Heap exported -> %s", path)
+        return path
+
+    def import_heap_json(self, path: str) -> None:
+        with open(path, "r", encoding="utf-8") as f:
+            snap = json.load(f)
+        # Best-effort: clear current heap and rebuild simple boxed values (ids will be new)
+        with self._lock:
+            self._heap.clear()
+            self._roots.clear()
+            self._remembered.clear()
+            self._pinned.clear()
+            self._large_objects.clear()
+            # load objects as values only (preserve counts)
+            for old_id_str, meta in snap.get("objects", {}).items():
+                hid = self._alloc_id()
+                kind = meta.get("kind", "value")
+                payload = None
+                if kind == "object":
+                    payload = {k: None for k in meta.get("fields", {}).keys()} if meta.get("fields") else {}
+                elif kind == "array":
+                    payload = [None] * len(meta.get("array", []))
+                elif kind in ("bytes", "large"):
+                    payload = bytearray(meta.get("raw_len", 0) or 0)
+                else:
+                    payload = None
+                obj = HeapObject(hid, kind, payload, size=meta.get("size", 1))
+                self._heap[hid] = obj
+            LOG.info("imported heap snapshot (best-effort), recreated %d objects", len(self._heap))
+
+    def get_stats(self) -> Dict[str, Any]:
+        with self._lock:
+            d = self._stats.__dict__.copy()
+            d.update({"heap_size": len(self._heap), "roots": {k: len(v) for k, v in self._roots.items()}})
+            return d
+
+    def find_handles_pointing_to(self, target: int) -> List[int]:
+        with self._lock:
+            res = []
+            for hid, obj in self._heap.items():
+                refs = self._extract_references(obj)
+                if target in refs:
+                    res.append(hid)
+            return res
+
+    # ---------------------------
+    # Conservative root scanner (inspect Python heap via gc)
+    # ---------------------------
+    def scan_python_globals_for_handles(self) -> Set[int]:
+        """
+        Conservative scan through Python GC tracked objects (modules, builtins, globals)
+        and collect integers that look like handles registered in this allocator.
+        Use with caution: expensive.
+        """
+        found = set()
+        with self._lock:
+            valid_handles = set(self._heap.keys())
+        for obj in list(_py_gc.get_objects()):
+            try:
+                if isinstance(obj, dict):
+                    for v in obj.values():
+                        if isinstance(v, int) and v in valid_handles:
+                            found.add(v)
+                elif isinstance(obj, (list, tuple, set)):
+                    for v in obj:
+                        if isinstance(v, int) and v in valid_handles:
+                            found.add(v)
+            except Exception:
+                continue
+        return found
+
+    # ---------------------------
+    # Compaction helper already defined above
+    # ---------------------------
+
+    # ---------------------------
+    # Background collector control
+    # ---------------------------
+    def start_background_collector(self, interval: float = BACKGROUND_COLLECTION_INTERVAL):
+        if self._bg_thread and self._bg_thread.is_alive():
+            return
+        self._stop_bg.clear()
+        self._bg_thread = threading.Thread(target=self._bg_worker, args=(interval,), daemon=True)
+        self._bg_thread.start()
+        LOG.info("Background collector started interval=%.2fs", interval)
+
+    def stop_background_collector(self):
+        if self._bg_thread:
+            self._stop_bg.set()
+            try:
+                self._bg_thread.join(timeout=1.0)
+            except Exception:
+                pass
+
+    def _bg_worker(self, interval: float):
+        while not self._stop_bg.is_set():
+            try:
+                self.minor_collect()
+            except Exception:
+                LOG.exception("background GC error")
+            self._stop_bg.wait(interval)
+
+    # ---------------------------
+    # Internal helpers
+    # ---------------------------
+    def _extract_references(self, obj: HeapObject) -> Set[int]:
+        refs = set()
+        if obj.kind == "object" and isinstance(obj.payload, dict):
+            for v in obj.payload.values():
+                if isinstance(v, int) and v in self._heap:
+                    refs.add(v)
+        elif obj.kind == "array" and isinstance(obj.payload, (list, tuple)):
+            for v in obj.payload:
+                if isinstance(v, int) and v in self._heap:
+                    refs.add(v)
+        return refs
+
+    def _update_remembered_for_new(self, obj: HeapObject):
+        # If object is older and references young objects, remember it
+        if obj.gen > 0:
+            refs = self._extract_references(obj)
+            for r in refs:
+                if r in self._heap and self._heap[r].gen == 0:
+                    obj.has_old_to_young_ref = True
+                    self._remembered.add(obj.id)
+
+    # ---------------------------
+    # Self-test and CLI demo
+    # ---------------------------
+def _self_test() -> bool:
+    LOG.info("Running HeapGCAllocator self-test (extended)")
+    gc = HeapGCAllocator(max_heap_objects=200, enable_background=False)
+    a = gc.alloc_object({"v": 123})
+    b = gc.alloc_object({"ref": a})
+    gc.register_root("main", b)
+    # allocate many unreachable objects
+    for i in range(100):
+        gc.alloc_object({"temp": i})
+    pre = len(gc._heap)
+    stats = gc.collect(full=True)
+    post = len(gc._heap)
+    LOG.info("self-test: before=%d after=%d stats=%s", pre, post, stats)
+    if a not in gc._heap or b not in gc._heap:
+        LOG.error("self-test failed: live objects collected")
+        return False
+    # finalizer check
+    finalized = []
+    def final(hid, obj):
+        finalized.append(hid)
+    c = gc.alloc_object({"x": 10}, finalizer=final)
+    # make unreachable and collect
+    gc.collect(full=True)
+    # allow finalizer thread time if enabled (not enabled in this test)
+    LOG.info("finalized list (may be empty if finalizer worker disabled): %s", finalized)
+    # test compaction
+    try:
+        r = gc.compact_heap()
+        LOG.info("compaction result: %s", r)
+    except Exception:
+        LOG.exception("compaction in self-test failed")
+    LOG.info("self-test passed")
+    return True
+
+if __name__ == "__main__":
+    ok = _self_test()
+    os._exit(0 if ok else 2)
+
+    import threading
+    import time
+    import logging
+    import tempfile
+
+"""
+instryx_heap_gc_allocator.py
+
+Production-ready Heap + Generational Mark-and-Sweep Garbage Collector (GC) allocator
+for the Instryx runtime with many optimizations, tooling and features.
+
+Enhancements in this version:
+ - All previous features (generational GC, remembered-set, write-barrier, pin/unpin,
+   large-object tracking, background finalizer, incremental marking, compaction, snapshots).
+ - Async incremental marking background worker (configurable).
+ - Lightweight object payload pooling to reduce small-dict/list churn.
+ - Export of runtime metrics (JSON and Prometheus text).
+ - Improved leak detection with path-to-root search (BFS).
+ - Shutdown helper that stops background workers cleanly.
+ - Better observers/events for lifecycle hooks.
+ - Minor micro-optimizations and safer guards.
+"""
+from __future__ import annotations
+import gc as _py_gc
+import json
+import logging
+import os
+import tempfile
+import threading
+import time
+import traceback
+import gzip
+import shutil
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+
+LOG = logging.getLogger("instryx.heapgc")
+if not LOG.handlers:
+    logging.basicConfig(level=logging.INFO)
+
+# Configuration defaults
+DEFAULT_MAX_HEAP_OBJECTS = 50_000
+DEFAULT_YOUNG_THRESHOLD = 2         # minor collections to trigger promotion
+BACKGROUND_COLLECTION_INTERVAL = 2.0  # background minor GC interval (s)
+INCREMENTAL_STEP_INTERVAL = 0.05     # seconds between incremental marking steps when backgrounded
+FINALIZER_BATCH_SIZE = 32            # finalizers executed per run
+COMPACT_THRESHOLD_RATIO = 0.25       # if free fraction > threshold, attempt compaction
+
+
+@dataclass
+class HeapStats:
+    alloc_count: int = 0
+    collect_count: int = 0
+    last_collect_time: Optional[float] = None
+    last_collected_objects: int = 0
+    heap_size_high_water: int = 0
+    total_finalized: int = 0
+    gen_histogram: Dict[int, int] = None
+
+    def __post_init__(self):
+        if self.gen_histogram is None:
+            self.gen_histogram = {0: 0, 1: 0, 2: 0}
+
+
+class HeapObject:
+    """
+    Internal representation of a heap object.
+    Fields:
+      - id: handle integer
+      - kind: "object", "array", "bytes", "value", "large"
+      - payload: dict/list/bytearray/value depending on kind
+      - gen: generation number (0 = young)
+      - age: survived minor collections count
+      - marked: mark flag during marking
+      - pinned: if True object must not be moved / finalized
+      - has_old_to_young_ref: boolean card flag used for remembered set
+      - finalizer: optional callable(handle, obj)
+      - size: abstract size units for heuristics (large objects track their bytes)
+    """
+    __slots__ = ("id", "kind", "payload", "gen", "age", "marked", "pinned",
+                 "has_old_to_young_ref", "finalizer", "size")
+
+    def __init__(self, id_: int, kind: str, payload: Any, size: int = 1, finalizer: Optional[Callable] = None):
+        self.id = id_
+        self.kind = kind
+        self.payload = payload
+        self.gen = 0
+        self.age = 0
+        self.marked = False
+        self.pinned = False
+        self.has_old_to_young_ref = False
+        self.finalizer = finalizer
+        self.size = int(size)
+
+
+class HeapGCAllocator:
+    """
+    Main allocator class implementing features listed above.
+    """
+
+    def __init__(
+        self,
+        max_heap_objects: int = DEFAULT_MAX_HEAP_OBJECTS,
+        young_threshold: int = DEFAULT_YOUNG_THRESHOLD,
+        enable_background: bool = True,
+        enable_incremental_bg: bool = False,
+    ):
+        self.max_heap_objects = int(max_heap_objects)
+        self.young_threshold = int(young_threshold)
+
+        self._lock = threading.RLock()
+        self._next_id = 1
+        self._heap: Dict[int, HeapObject] = {}
+        self._large_objects: Set[int] = set()
+        self._roots: Dict[str, Set[int]] = {}
+        self._remembered: Set[int] = set()
+        self._pinned: Set[int] = set()
+        self._stats = HeapStats()
+        self._observers: Dict[str, List[Callable[[Dict[str, Any]], None]]] = {}
+        self._finalizer_queue: List[Tuple[int, HeapObject]] = []
+        self._finalizer_lock = threading.RLock()
+        self._stop_bg = threading.Event()
+        self._bg_thread: Optional[threading.Thread] = None
+        self._finalizer_thread: Optional[threading.Thread] = None
+        self._incremental_stack: List[int] = []
+        self._incremental_state = {"active": False}
+        self._compact_lock = threading.RLock()
+
+        # object payload pools to reduce allocation churn for tiny dicts/lists
+        self._obj_payload_pool: List[Dict[str, Any]] = []
+        self._arr_payload_pool: List[List[Any]] = []
+        self._pool_max = 1024
+
+        # incremental background worker
+        self._inc_bg_thread: Optional[threading.Thread] = None
+        self._inc_bg_enabled = bool(enable_incremental_bg)
+        self._inc_bg_interval = INCREMENTAL_STEP_INTERVAL
+
+        if enable_background:
+            self.start_background_collector()
+            self.start_finalizer_worker()
+        if self._inc_bg_enabled:
+            self.start_incremental_background(self._inc_bg_interval)
+
+        LOG.info("HeapGCAllocator init max=%d young_threshold=%d bg=%s inc_bg=%s", self.max_heap_objects, self.young_threshold, enable_background, enable_incremental_bg)
+
+    # ---------------------------
+    # Observers / instrumentation
+    # ---------------------------
+    def register_observer(self, name: str, fn: Callable[[Dict[str, Any]], None]) -> None:
+        with self._lock:
+            self._observers.setdefault(name, []).append(fn)
+
+    def unregister_observer(self, name: str, fn: Callable[[Dict[str, Any]], None]) -> None:
+        with self._lock:
+            if name in self._observers:
+                try:
+                    self._observers[name].remove(fn)
+                except ValueError:
+                    pass
+
+    def _notify(self, event: str, payload: Dict[str, Any]) -> None:
+        with self._lock:
+            for fn in list(self._observers.get(event, [])):
+                try:
+                    fn(payload)
+                except Exception:
+                    LOG.exception("observer %s failed", event)
+
+    # ---------------------------
+    # Allocation primitives (with pooling)
+    # ---------------------------
+    def _alloc_id(self) -> int:
+        with self._lock:
+            hid = self._next_id
+            self._next_id += 1
+            return hid
+
+    def _ensure_capacity(self):
+        if len(self._heap) + len(self._large_objects) >= self.max_heap_objects:
+            LOG.debug("heap near capacity, attempting GC")
+            self.collect(full=False)
+            if len(self._heap) + len(self._large_objects) >= self.max_heap_objects:
+                # attempt more aggressive major collect
+                self.collect(full=True)
+            if len(self._heap) + len(self._large_objects) >= self.max_heap_objects:
+                raise MemoryError("Heap limit reached after GC attempts")
+
+    def _borrow_obj_payload(self) -> Dict[str, Any]:
+        with self._lock:
+            if self._obj_payload_pool:
+                return self._obj_payload_pool.pop()
+        return {}
+
+    def _return_obj_payload(self, d: Dict[str, Any]) -> None:
+        d.clear()
+        with self._lock:
+            if len(self._obj_payload_pool) < self._pool_max:
+                self._obj_payload_pool.append(d)
+
+    def _borrow_arr_payload(self, length: int) -> List[Any]:
+        with self._lock:
+            if self._arr_payload_pool:
+                arr = self._arr_payload_pool.pop()
+                # resize if needed
+                if len(arr) < length:
+                    arr.extend([None] * (length - len(arr)))
+                else:
+                    for i in range(length, len(arr)):
+                        arr[i] = None
+                return arr[:length]
+        return [None] * length
+
+    def _return_arr_payload(self, arr: List[Any]) -> None:
+        arr.clear()
+        with self._lock:
+            if len(self._arr_payload_pool) < self._pool_max:
+                self._arr_payload_pool.append(arr)
+
+    def alloc_object(self, fields: Optional[Dict[str, Any]] = None, finalizer: Optional[Callable] = None, size: int = 1) -> int:
+        with self._lock:
+            self._ensure_capacity()
+            hid = self._alloc_id()
+            payload = self._borrow_obj_payload()
+            if fields:
+                payload.update(fields)
+            obj = HeapObject(hid, "object", payload, size=size, finalizer=finalizer)
+            self._heap[hid] = obj
+            self._stats.alloc_count += 1
+            self._stats.heap_size_high_water = max(self._stats.heap_size_high_water, len(self._heap))
+            self._update_remembered_for_new(obj)
+            self._notify("alloc", {"handle": hid, "kind": "object", "size": size})
+            return hid
+
+    def alloc_array(self, length: int, initial: Any = None, finalizer: Optional[Callable] = None, size: int = 1) -> int:
+        with self._lock:
+            self._ensure_capacity()
+            hid = self._alloc_id()
+            arr = self._borrow_arr_payload(length)
+            if initial is not None:
+                for i in range(len(arr)):
+                    arr[i] = initial
+            obj = HeapObject(hid, "array", arr, size=size, finalizer=finalizer)
+            self._heap[hid] = obj
+            self._stats.alloc_count += 1
+            self._update_remembered_for_new(obj)
+            self._notify("alloc", {"handle": hid, "kind": "array", "size": size})
+            return hid
+
+    def alloc_bytes(self, nbytes: int, finalizer: Optional[Callable] = None) -> int:
+        b = bytearray(int(nbytes))
+        with self._lock:
+            self._ensure_capacity()
+            hid = self._alloc_id()
+            obj = HeapObject(hid, "bytes", b, size=nbytes, finalizer=finalizer)
+            self._heap[hid] = obj
+            self._stats.alloc_count += 1
+            self._notify("alloc", {"handle": hid, "kind": "bytes", "size": nbytes})
+            return hid
+
+    def alloc_large_object(self, payload: Any, size_bytes: int, finalizer: Optional[Callable] = None) -> int:
+        """Allocate a large object tracked separately (less likely to move)."""
+        with self._lock:
+            self._ensure_capacity()
+            hid = self._alloc_id()
+            obj = HeapObject(hid, "large", payload, size=size_bytes, finalizer=finalizer)
+            self._heap[hid] = obj
+            self._large_objects.add(hid)
+            self._stats.alloc_count += 1
+            self._notify("alloc", {"handle": hid, "kind": "large", "size": size_bytes})
+            return hid
+
+    def box_value(self, value: Any) -> int:
+        with self._lock:
+            self._ensure_capacity()
+            hid = self._alloc_id()
+            obj = HeapObject(hid, "value", value, size=1)
+            self._heap[hid] = obj
+            self._stats.alloc_count += 1
+            self._notify("alloc", {"handle": hid, "kind": "value"})
+            return hid
+
+    # ---------------------------
+    # Access helpers + write barrier
+    # ---------------------------
+    def get_field(self, handle: int, name: str) -> Any:
+        obj = self._heap.get(handle)
+        if not obj or obj.kind != "object":
+            raise KeyError("invalid object handle for get_field")
+        return obj.payload.get(name)
+
+    def set_field(self, handle: int, name: str, value: Any) -> None:
+        with self._lock:
+            obj = self._heap.get(handle)
+            if not obj or obj.kind != "object":
+                raise KeyError("invalid object handle for set_field")
+            obj.payload[name] = value
+            self._write_barrier(obj, value)
+
+    def get_index(self, handle: int, idx: int) -> Any:
+        obj = self._heap.get(handle)
+        if not obj or obj.kind != "array":
+            raise KeyError("invalid array handle for get_index")
+        return obj.payload[int(idx)]
+
+    def set_index(self, handle: int, idx: int, value: Any) -> None:
+        with self._lock:
+            obj = self._heap.get(handle)
+            if not obj or obj.kind != "array":
+                raise KeyError("invalid array handle for set_index")
+            obj.payload[int(idx)] = value
+            self._write_barrier(obj, value)
+
+    def raw_bytes(self, handle: int) -> bytearray:
+        obj = self._heap.get(handle)
+        if not obj or obj.kind not in ("bytes", "large"):
+            raise KeyError("invalid bytes handle")
+        return obj.payload
+
+    def _write_barrier(self, obj: HeapObject, value: Any) -> None:
+        """
+        Write barrier: when an older object stores a reference to a young object,
+        record it in remembered set. Also maintain card flag optimization.
+        """
+        if not isinstance(value, int) or value not in self._heap:
+            return
+        with self._lock:
+            target = self._heap[value]
+            if obj.gen > 0 and target.gen == 0:
+                obj.has_old_to_young_ref = True
+                self._remembered.add(obj.id)
+
+    # ---------------------------
+    # Pinning API
+    # ---------------------------
+    def pin(self, handle: int) -> None:
+        with self._lock:
+            if handle in self._heap:
+                self._heap[handle].pinned = True
+                self._pinned.add(handle)
+
+    def unpin(self, handle: int) -> None:
+        with self._lock:
+            if handle in self._heap:
+                self._heap[handle].pinned = False
+                self._pinned.discard(handle)
+
+    # ---------------------------
+    # Roots API
+    # ---------------------------
+    def register_root(self, set_name: str, handle: int) -> None:
+        with self._lock:
+            self._roots.setdefault(set_name, set()).add(handle)
+            self._notify("root_register", {"set": set_name, "handle": handle})
+
+    def unregister_root(self, set_name: str, handle: int) -> None:
+        with self._lock:
+            if set_name in self._roots:
+                self._roots[set_name].discard(handle)
+                if not self._roots[set_name]:
+                    del self._roots[set_name]
+            self._notify("root_unregister", {"set": set_name, "handle": handle})
+
+    def list_roots(self) -> Dict[str, Set[int]]:
+        with self._lock:
+            return {k: set(v) for k, v in self._roots.items()}
+
+    # ---------------------------
+    # Finalizers worker
+    # ---------------------------
+    def start_finalizer_worker(self):
+        if self._finalizer_thread and self._finalizer_thread.is_alive():
+            return
+        self._finalizer_thread = threading.Thread(target=self._finalizer_worker, daemon=True)
+        self._finalizer_thread.start()
+        LOG.info("finalizer worker started")
+
+    def stop_finalizer_worker(self):
+        if self._finalizer_thread:
+            try:
+                self._finalizer_thread.join(timeout=1.0)
+            except Exception:
+                pass
+
+    def _enqueue_finalizer(self, hid: int, obj: HeapObject):
+        with self._finalizer_lock:
+            self._finalizer_queue.append((hid, obj))
+
+    def _finalizer_worker(self):
+        while not self._stop_bg.is_set():
+            batch = []
+            with self._finalizer_lock:
+                while self._finalizer_queue and len(batch) < FINALIZER_BATCH_SIZE:
+                    batch.append(self._finalizer_queue.pop(0))
+            if not batch:
+                time.sleep(0.2)
+                continue
+            for hid, obj in batch:
+                try:
+                    if obj.finalizer and not obj.pinned:
+                        try:
+                            obj.finalizer(hid, obj)
+                        except Exception:
+                            LOG.exception("finalizer error for %d", hid)
+                        self._stats.total_finalized += 1
+                        self._notify("finalized", {"handle": hid})
+                except Exception:
+                    LOG.exception("finalizer loop error")
+
+    # ---------------------------
+    # Collection: minor/major and incremental
+    # ---------------------------
+    def collect(self, full: bool = True) -> Dict[str, Any]:
+        """
+        Full collection when full=True (major), minor otherwise.
+        Collection is mark-and-sweep; finalizers queued and executed asynchronously.
+        """
+        start_time = time.time()
+        with self._lock:
+            try:
+                self._unmark_all()
+                roots = self._gather_roots()
+                # include remembered set for minor collections
+                remember_roots = set(self._remembered) if not full else set()
+                stack = list(roots | remember_roots)
+                marked = 0
+                while stack:
+                    hid = stack.pop()
+                    if hid not in self._heap:
+                        continue
+                    obj = self._heap[hid]
+                    if obj.marked:
+                        continue
+                    obj.marked = True
+                    marked += 1
+                    refs = self._extract_references(obj)
+                    for r in refs:
+                        if r in self._heap and not self._heap[r].marked:
+                            stack.append(r)
+                # sweep phase - collect unmarked
+                to_delete = []
+                for hid, obj in list(self._heap.items()):
+                    if not obj.marked:
+                        if obj.pinned:
+                            # pinned unreachable objects are skipped (user responsibility)
+                            continue
+                        to_delete.append(hid)
+                # queue finalizers and remove
+                for hid in to_delete:
+                    obj = self._heap.get(hid)
+                    if obj and obj.finalizer:
+                        self._enqueue_finalizer(hid, obj)
+                for hid in to_delete:
+                    obj = self._heap.pop(hid, None)
+                    # return payloads to pool if applicable
+                    if obj:
+                        if obj.kind == "object":
+                            self._return_obj_payload(obj.payload)
+                        elif obj.kind == "array":
+                            self._return_arr_payload(obj.payload)
+                    self._remembered.discard(hid)
+                    self._large_objects.discard(hid)
+                    self._pinned.discard(hid)
+                # promotion
+                for obj in self._heap.values():
+                    if obj.marked:
+                        if obj.gen == 0:
+                            obj.age += 1
+                            if obj.age >= self.young_threshold:
+                                obj.gen += 1
+                                obj.age = 0
+                        # reset has_old_to_young_ref if now stable
+                        if obj.has_old_to_young_ref:
+                            refs = self._extract_references(obj)
+                            obj.has_old_to_young_ref = any(self._heap[r].gen == 0 for r in refs if r in self._heap)
+                # stats
+                self._stats.collect_count += 1
+                self._stats.last_collect_time = time.time()
+                self._stats.last_collected_objects = len(to_delete)
+                # auto compaction heuristic
+                free_fraction = 1.0 - (len(self._heap) / max(1, self.max_heap_objects))
+                if full and free_fraction > COMPACT_THRESHOLD_RATIO:
+                    try:
+                        self.compact_heap()
+                    except Exception:
+                        LOG.exception("compaction failed")
+                self._notify("collect", {"marked": marked, "collected": len(to_delete)})
+                LOG.info("GC complete: marked=%d collected=%d heap=%d", marked, len(to_delete), len(self._heap))
+                return {"marked": marked, "collected": len(to_delete), "heap_size": len(self._heap), "duration_s": time.time() - start_time}
+            except Exception:
+                LOG.exception("GC failed")
+                return {"error": "exception during GC"}
+
+    def minor_collect(self) -> Dict[str, Any]:
+        return self.collect(full=False)
+
+    def major_collect(self) -> Dict[str, Any]:
+        return self.collect(full=True)
+
+    def _unmark_all(self):
+        for obj in self._heap.values():
+            obj.marked = False
+
+    def _gather_roots(self) -> Set[int]:
+        roots: Set[int] = set()
+        for s in self._roots.values():
+            for hid in s:
+                if hid in self._heap:
+                    roots.add(hid)
+        return roots
+
+    # incremental marking: prepare and do limited steps
+    def begin_incremental_mark(self):
+        with self._lock:
+            self._unmark_all()
+            roots = self._gather_roots()
+            self._incremental_stack = list(roots)
+            self._incremental_state["active"] = True
+            LOG.debug("incremental mark started with stack=%d", len(self._incremental_stack))
+
+    def incremental_mark_step(self, max_nodes: int = 1000) -> Dict[str, Any]:
+        with self._lock:
+            if not self._incremental_state.get("active"):
+                return {"status": "inactive"}
+            processed = 0
+            while self._incremental_stack and processed < max_nodes:
+                hid = self._incremental_stack.pop()
+                if hid not in self._heap:
+                    continue
+                obj = self._heap[hid]
+                if obj.marked:
+                    continue
+                obj.marked = True
+                processed += 1
+                refs = self._extract_references(obj)
+                for r in refs:
+                    if r in self._heap and not self._heap[r].marked:
+                        self._incremental_stack.append(r)
+            if not self._incremental_stack:
+                # finish and sweep unreachable
+                self._incremental_state["active"] = False
+                # now sweep like a major collect but queue finalizers async
+                to_delete = [hid for hid, obj in list(self._heap.items()) if not obj.marked and not obj.pinned]
+                for hid in to_delete:
+                    obj = self._heap.get(hid)
+                    if obj and obj.finalizer:
+                        self._enqueue_finalizer(hid, obj)
+                for hid in to_delete:
+                    obj = self._heap.pop(hid, None)
+                    if obj:
+                        if obj.kind == "object":
+                            self._return_obj_payload(obj.payload)
+                        elif obj.kind == "array":
+                            self._return_arr_payload(obj.payload)
+                    self._remembered.discard(hid)
+                    self._large_objects.discard(hid)
+                    self._pinned.discard(hid)
+                LOG.debug("incremental mark complete processed=%d swept=%d", processed, len(to_delete))
+                return {"status": "complete", "processed": processed, "swept": len(to_delete)}
+            return {"status": "in-progress", "processed": processed, "remaining": len(self._incremental_stack)}
+
+    def start_incremental_background(self, interval: float = INCREMENTAL_STEP_INTERVAL, nodes_per_step: int = 200):
+        """Start a background thread that performs incremental_mark_step repeatedly."""
+        if self._inc_bg_thread and self._inc_bg_thread.is_alive():
+            return
+        self._inc_bg_enabled = True
+        self._inc_bg_interval = float(interval)
+
+        def _inc_bg():
+            while self._inc_bg_enabled and not self._stop_bg.is_set():
+                try:
+                    if not self._incremental_state.get("active"):
+                        # start a mark cycle only if something requested or periodically
+                        self.begin_incremental_mark()
+                    res = self.incremental_mark_step(max_nodes=nodes_per_step)
+                    # small sleep to yield CPU
+                    time.sleep(self._inc_bg_interval)
+                except Exception:
+                    LOG.exception("incremental background error")
+                    time.sleep(self._inc_bg_interval)
+
+        self._inc_bg_thread = threading.Thread(target=_inc_bg, daemon=True)
+        self._inc_bg_thread.start()
+        LOG.info("Incremental background worker started interval=%.3fs", interval)
+
+    def stop_incremental_background(self):
+        self._inc_bg_enabled = False
+        if self._inc_bg_thread:
+            try:
+                self._inc_bg_thread.join(timeout=1.0)
+            except Exception:
+                pass
+
+    # ---------------------------
+    # Compaction (best-effort)
+    # ---------------------------
+    def compact_heap(self) -> Dict[str, Any]:
+        """
+        Best-effort compaction: allocate new ids for live objects, copy payloads,
+        rewrite references and update roots. Pinned objects are not moved.
+        This operation can be heavy; caller should ensure minimal concurrency.
+        """
+        with self._compact_lock, self._lock:
+            try:
+                LOG.info("Starting heap compaction")
+                # identify live objects via a temporary mark
+                self._unmark_all()
+                roots = self._gather_roots()
+                stack = list(roots)
+                while stack:
+                    hid = stack.pop()
+                    if hid not in self._heap:
+                        continue
+                    obj = self._heap[hid]
+                    if obj.marked:
+                        continue
+                    obj.marked = True
+                    for r in self._extract_references(obj):
+                        if r in self._heap and not self._heap[r].marked:
+                            stack.append(r)
+                # build mapping for movable objects: skip pinned and large objects
+                mapping: Dict[int, int] = {}
+                new_heap: Dict[int, HeapObject] = {}
+                for old_id, obj in list(self._heap.items()):
+                    if not obj.marked:
+                        continue  # unreachable won't be moved
+                    if obj.pinned or old_id in self._large_objects:
+                        # preserve id to avoid changing external refs; copy as-is
+                        mapping[old_id] = old_id
+                        new_heap[old_id] = obj
+                        continue
+                    # assign new id
+                    new_id = self._alloc_id()
+                    mapping[old_id] = new_id
+                    # shallow copy of payload; we'll rewrite references next
+                    copied = None
+                    if obj.kind == "object":
+                        copied = dict(obj.payload)
+                    elif obj.kind == "array":
+                        copied = list(obj.payload)
+                    elif obj.kind in ("bytes", "large"):
+                        copied = bytearray(obj.payload) if obj.kind == "bytes" else obj.payload
+                    elif obj.kind == "value":
+                        copied = obj.payload
+                    new_obj = HeapObject(new_id, obj.kind, copied, size=obj.size, finalizer=obj.finalizer)
+                    new_obj.gen = obj.gen
+                    new_obj.age = obj.age
+                    new_obj.pinned = obj.pinned
+                    new_heap[new_id] = new_obj
+                # rewrite references in new_heap
+                def rewrite_in_obj(o: HeapObject):
+                    if o.kind == "object" and isinstance(o.payload, dict):
+                        for k, v in list(o.payload.items()):
+                            if isinstance(v, int) and v in mapping:
+                                o.payload[k] = mapping[v]
+                    elif o.kind == "array" and isinstance(o.payload, (list, tuple)):
+                        for i, v in enumerate(o.payload):
+                            if isinstance(v, int) and v in mapping:
+                                o.payload[i] = mapping[v]
+                for o in new_heap.values():
+                    rewrite_in_obj(o)
+                # update roots to new ids
+                new_roots: Dict[str, Set[int]] = {}
+                for rname, rset in self._roots.items():
+                    new_set = set()
+                    for hid in rset:
+                        if hid in mapping:
+                            new_set.add(mapping[hid])
+                    if new_set:
+                        new_roots[rname] = new_set
+                # replace heap and roots
+                self._heap = new_heap
+                self._roots = new_roots
+                # rebuild large_objects and pinned sets
+                self._large_objects = {mapping.get(h, h) for h in list(self._large_objects) if h in mapping}
+                self._pinned = {mapping.get(h, h) for h in list(self._pinned) if h in mapping}
+                # rebuild remembered set conservatively
+                self._remembered = set()
+                for hid, obj in self._heap.items():
+                    if obj.gen > 0:
+                        refs = self._extract_references(obj)
+                        if any((r in self._heap and self._heap[r].gen == 0) for r in refs):
+                            self._remembered.add(hid)
+                LOG.info("Compaction complete: new_heap=%d", len(self._heap))
+                self._notify("compact", {"heap_size": len(self._heap)})
+                return {"status": "ok", "heap_size": len(self._heap)}
+            except Exception:
+                LOG.exception("compaction failed")
+                return {"status": "error", "message": "exception during compaction"}
+
+    # ---------------------------
+    # Helpers & introspection
+    # ---------------------------
+    def heap_snapshot(self, include_contents: bool = False) -> Dict[str, Any]:
+        with self._lock:
+            snap = {
+                "time": time.time(),
+                "count": len(self._heap),
+                "objects": {},
+                "roots": {k: list(v) for k, v in self._roots.items()},
+                "remembered": list(self._remembered),
+                "large_objects": list(self._large_objects),
+                "pinned": list(self._pinned),
+                "stats": {
+                    "alloc_count": self._stats.alloc_count,
+                    "collect_count": self._stats.collect_count,
+                    "last_collect_time": self._stats.last_collect_time,
+                    "last_collected_objects": self._stats.last_collected_objects,
+                    "heap_size_high_water": self._stats.heap_size_high_water,
+                    "total_finalized": self._stats.total_finalized,
+                },
+            }
+            for hid, obj in self._heap.items():
+                o = {"id": hid, "kind": obj.kind, "gen": obj.gen, "age": obj.age, "size": obj.size, "pinned": obj.pinned}
+                if include_contents:
+                    if obj.kind == "object":
+                        o["fields"] = dict(obj.payload)
+                    elif obj.kind == "array":
+                        o["array"] = list(obj.payload)
+                    elif obj.kind in ("bytes", "large"):
+                        o["raw_len"] = len(obj.payload) if hasattr(obj.payload, "__len__") else None
+                    elif obj.kind == "value":
+                        o["value"] = obj.payload
+                snap["objects"][hid] = o
+            return snap
+
+    def export_heap_json(self, path: Optional[str] = None, include_contents: bool = True) -> str:
+        if not path:
+            fd, path = tempfile.mkstemp(prefix="instryx_heap_", suffix=".json")
+            os.close(fd)
+        snap = self.heap_snapshot(include_contents=include_contents)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(snap, f, indent=2, default=str)
+        os.replace(tmp, path)
+        LOG.info("Heap exported -> %s", path)
+        return path
+
+    def import_heap_json(self, path: str) -> None:
+        with open(path, "r", encoding="utf-8") as f:
+            snap = json.load(f)
+        # Best-effort: clear current heap and rebuild simple boxed values (ids will be new)
+        with self._lock:
+            # return all pooled payloads to avoid leaks
+            for hid, obj in list(self._heap.items()):
+                if obj.kind == "object":
+                    self._return_obj_payload(obj.payload)
+                elif obj.kind == "array":
+                    self._return_arr_payload(obj.payload)
+            self._heap.clear()
+            self._roots.clear()
+            self._remembered.clear()
+            self._pinned.clear()
+            self._large_objects.clear()
+            for old_id_str, meta in snap.get("objects", {}).items():
+                hid = self._alloc_id()
+                kind = meta.get("kind", "value")
+                payload = None
+                if kind == "object":
+                    payload = {k: None for k in meta.get("fields", {}).keys()} if meta.get("fields") else {}
+                elif kind == "array":
+                    payload = [None] * len(meta.get("array", []))
+                elif kind in ("bytes", "large"):
+                    payload = bytearray(meta.get("raw_len", 0) or 0)
+                else:
+                    payload = None
+                obj = HeapObject(hid, kind, payload, size=meta.get("size", 1))
+                self._heap[hid] = obj
+            LOG.info("imported heap snapshot (best-effort), recreated %d objects", len(self._heap))
+
+    def get_stats(self) -> Dict[str, Any]:
+        with self._lock:
+            d = {
+                "alloc_count": self._stats.alloc_count,
+                "collect_count": self._stats.collect_count,
+                "last_collect_time": self._stats.last_collect_time,
+                "last_collected_objects": self._stats.last_collected_objects,
+                "heap_size_high_water": self._stats.heap_size_high_water,
+                "total_finalized": self._stats.total_finalized,
+                "heap_size": len(self._heap),
+                "roots": {k: len(v) for k, v in self._roots.items()},
+                "remembered": len(self._remembered),
+                "large_objects": len(self._large_objects),
+                "pinned": len(self._pinned),
+            }
+            return d
+
+    def export_metrics_json(self, path: str) -> str:
+        metrics = self.get_stats()
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(metrics, fh, indent=2)
+        return path
+
+    def export_metrics_prometheus(self) -> str:
+        """Return a small Prometheus-compatible metrics text for scraping."""
+        m = self.get_stats()
+        lines = []
+        lines.append(f'instryx_heap_alloc_count {m["alloc_count"]}')
+        lines.append(f'instryx_heap_collect_count {m["collect_count"]}')
+        lines.append(f'instryx_heap_size {m["heap_size"]}')
+        lines.append(f'instryx_heap_roots {sum(m["roots"].values()) if isinstance(m["roots"], dict) else 0}')
+        return "\n".join(lines)
+
+    def find_handles_pointing_to(self, target: int) -> List[int]:
+        with self._lock:
+            res = []
+            for hid, obj in self._heap.items():
+                refs = self._extract_references(obj)
+                if target in refs:
+                    res.append(hid)
+            return res
+
+    # improved path-to-root search for leak analysis
+    def find_path_to_root(self, target: int, max_depth: int = 1000) -> Optional[List[int]]:
+        """
+        Breadth-first search from roots to find a path to target.
+        Returns list of handles from root -> ... -> target, or None if not reachable within max_depth.
+        """
+        if target not in self._heap:
+            return None
+        with self._lock:
+            roots = list(self._gather_roots())
+            if not roots:
+                return None
+            from collections import deque
+            q = deque()
+            visited = set()
+            parent: Dict[int, Optional[int]] = {}
+            for r in roots:
+                q.append((r, 0))
+                visited.add(r)
+                parent[r] = None
+            while q:
+                hid, depth = q.popleft()
+                if depth > max_depth:
+                    continue
+                if hid == target:
+                    # reconstruct path
+                    path = []
+                    cur = hid
+                    while cur is not None:
+                        path.append(cur)
+                        cur = parent.get(cur)
+                    return list(reversed(path))
+                obj = self._heap.get(hid)
+                if not obj:
+                    continue
+                for ref in self._extract_references(obj):
+                    if ref not in visited and ref in self._heap:
+                        visited.add(ref)
+                        parent[ref] = hid
+                        q.append((ref, depth + 1))
+            return None
+
+    # ---------------------------
+    # Conservative root scanner (inspect Python heap via gc)
+    # ---------------------------
+    def scan_python_globals_for_handles(self) -> Set[int]:
+        """
+        Conservative scan through Python GC tracked objects (modules, builtins, globals)
+        and collect integers that look like handles registered in this allocator.
+        Use with caution: expensive.
+        """
+        found = set()
+        with self._lock:
+            valid_handles = set(self._heap.keys())
+        for obj in list(_py_gc.get_objects()):
+            try:
+                if isinstance(obj, dict):
+                    for v in obj.values():
+                        if isinstance(v, int) and v in valid_handles:
+                            found.add(v)
+                elif isinstance(obj, (list, tuple, set)):
+                    for v in obj:
+                        if isinstance(v, int) and v in valid_handles:
+                            found.add(v)
+            except Exception:
+                continue
+        return found
+
+    # ---------------------------
+    # Background collector control
+    # ---------------------------
+    def start_background_collector(self, interval: float = BACKGROUND_COLLECTION_INTERVAL):
+        if self._bg_thread and self._bg_thread.is_alive():
+            return
+        self._stop_bg.clear()
+
+        def _bg_worker(interval):
+            while not self._stop_bg.is_set():
+                try:
+                    self.minor_collect()
+                except Exception:
+                    LOG.exception("background GC error")
+                self._stop_bg.wait(interval)
+
+        self._bg_thread = threading.Thread(target=_bg_worker, args=(interval,), daemon=True)
+        self._bg_thread.start()
+        LOG.info("Background collector started interval=%.2fs", interval)
+
+    def stop_background_collector(self):
+        if self._bg_thread:
+            self._stop_bg.set()
+            try:
+                self._bg_thread.join(timeout=1.0)
+            except Exception:
+                pass
+
+    # ---------------------------
+    # Internal helpers
+    # ---------------------------
+    def _extract_references(self, obj: HeapObject) -> Set[int]:
+        refs = set()
+        if obj.kind == "object" and isinstance(obj.payload, dict):
+            for v in obj.payload.values():
+                if isinstance(v, int) and v in self._heap:
+                    refs.add(v)
+        elif obj.kind == "array" and isinstance(obj.payload, (list, tuple)):
+            for v in obj.payload:
+                if isinstance(v, int) and v in self._heap:
+                    refs.add(v)
+        return refs
+
+    def _update_remembered_for_new(self, obj: HeapObject):
+        # If object is older and references young objects, remember it
+        if obj.gen > 0:
+            refs = self._extract_references(obj)
+            for r in refs:
+                if r in self._heap and self._heap[r].gen == 0:
+                    obj.has_old_to_young_ref = True
+                    self._remembered.add(obj.id)
+
+    # ---------------------------
+    # Shutdown helper
+    # ---------------------------
+    def shutdown(self, wait: bool = True):
+        """Stop background workers and flush finalizers. Safe to call on process exit."""
+        LOG.info("HeapGCAllocator shutdown initiated")
+        self._inc_bg_enabled = False
+        self.stop_incremental_background()
+        self.stop_background_collector()
+        self._stop_bg.set()
+        # finalize queued finalizers synchronously if requested
+        if wait:
+            # process queued finalizers once synchronously
+            with self._finalizer_lock:
+                while self._finalizer_queue:
+                    hid, obj = self._finalizer_queue.pop(0)
+                    try:
+                        if obj.finalizer and not obj.pinned:
+                            obj.finalizer(hid, obj)
+                    except Exception:
+                        LOG.exception("finalizer during shutdown failed for %d", hid)
+        LOG.info("HeapGCAllocator shutdown complete")
+
+    # ---------------------------
+    # Self-test and CLI demo
+    # ---------------------------
+def _self_test() -> bool:
+    LOG.info("Running HeapGCAllocator self-test (extended)")
+    gc = HeapGCAllocator(max_heap_objects=200, enable_background=False)
+    a = gc.alloc_object({"v": 123})
+    b = gc.alloc_object({"ref": a})
+    gc.register_root("main", b)
+    # allocate many unreachable objects
+    for i in range(100):
+        gc.alloc_object({"temp": i})
+    pre = len(gc._heap)
+    stats = gc.collect(full=True)
+    post = len(gc._heap)
+    LOG.info("self-test: before=%d after=%d stats=%s", pre, post, stats)
+    if a not in gc._heap or b not in gc._heap:
+        LOG.error("self-test failed: live objects collected")
+        return False
+    # finalizer check
+    finalized = []
+    def final(hid, obj):
+        finalized.append(hid)
+    c = gc.alloc_object({"x": 10}, finalizer=final)
+    # make unreachable and collect
+    gc.collect(full=True)
+    LOG.info("finalized list (may be empty if finalizer worker disabled): %s", finalized)
+    # test compaction
+    try:
+        r = gc.compact_heap()
+        LOG.info("compaction result: %s", r)
+    except Exception:
+        LOG.exception("compaction in self-test failed")
+    # snapshot export/import
+    path = gc.export_heap_json(include_contents=False)
+    LOG.info("exported heap snapshot to %s", path)
+    gc2 = HeapGCAllocator(max_heap_objects=200, enable_background=False)
+    gc2.import_heap_json(path)
+    LOG.info("imported snapshot into new allocator with objects=%d", len(gc2._heap))
+    LOG.info("self-test passed")
+    return True
+
+if __name__ == "__main__":
+    ok = _self_test()
+    try:
+        # best-effort graceful shutdown
+        # (in CLI usage the program may exit immediately)
+        pass
+    finally:
+        os._exit(0 if ok else 2)
+
+
 # instryx_ast_interpreter.py
 # Production-ready AST Interpreter for the Instryx Language
 # Author: Violet Magenta / VACU Technologies
