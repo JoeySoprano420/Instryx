@@ -2040,3 +2040,127 @@ This file is essentially the core toolkit for the **Instryx** language:
 - It encompasses advanced infrastructure for **macros, code helpers, SQL diagnostics, optimization, garbage collection, WASM, and shell UI**.
 - It is highly modular, with many classes and functions supporting **expansion, plugin-based transformation, and live diagnostics**.
 
+## -----
+
+---
+
+## 🧩 How to Add a Macro to a Function
+
+Instryx uses **CIAMS macros** (Contextual Inference Macros) to auto-expand behavior based on context. To add a macro to a function:
+
+### 🔧 Example with `@wraptry` Macro
+```instryx
+func greet(name) {
+    @wraptry print: "Hey " + name + "!";
+};
+```
+
+This wraps the `print` statement in a **quarantine block** automatically, handling errors gracefully.
+
+### 🔧 Example with `@inject`
+```instryx
+func connectDB() {
+    @inject db.conn;
+    query = db.conn.query("SELECT * FROM users;");
+};
+```
+
+This auto-injects a database connection into the function scope.
+
+Macros are placed **before statements or calls**, and they expand during compilation. You can even chain them for layered behavior.
+
+---
+
+## 🚨 Common Syntax Errors in Instryx
+
+Instryx is strict and instructional, so here are frequent pitfalls:
+
+- **Missing semicolons**: Every statement must end with `;`
+- **Incorrect function parameters**: Use variable names, not literals
+  - ❌ `func greet("Joey") { ... };`
+  - ✅ `func greet(name) { ... };`
+- **Unmatched braces `{}`**: Blocks must be properly closed
+- **Improper macro placement**: Macros must precede valid expressions
+- **Using undefined variables**: All variables must be declared before use
+
+Instryx’s parser now includes **error recovery and diagnostics**, so it’ll often tell you exactly what went wrong and where.
+
+---
+
+## 📦 Variable Scope in Instryx
+
+Instryx uses **Isolated Virtual Registers (IVR)** per scope. Here's how it works:
+
+- **Local Scope**: Variables declared inside a function or block are local to that block.
+- **Global Scope**: Variables declared outside any function are accessible globally.
+- **Macro Scope**: Macros can inject variables into local scope, but they don’t persist globally.
+- **Shadowing**: You can redeclare a variable in a nested block, which shadows the outer one.
+
+### 🔍 Example
+```instryx
+data: [1, 2, 3];
+
+func processData() {
+    data = [4, 5, 6];  -- shadows global 'data'
+    print: data;
+};
+```
+
+The function prints `[4, 5, 6]`, not the global `[1, 2, 3]`.
+
+---
+
+## 📘 Instryx Syntax Rules
+
+Instryx syntax is designed to be **imperative, readable, and non-ambiguous**:
+
+| Element         | Syntax Example                          | Notes |
+|----------------|------------------------------------------|-------|
+| Comments        | `-- This is a comment`                   | SQL-style |
+| Statements      | `print: "Hello";`                        | End with `;` |
+| Functions       | `func name(param) { ... };`              | Explicit blocks |
+| Entry Point     | `main() { ... };`                        | Required |
+| Control Flow    | `if x > 2 then { ... };`                 | Uses `then`, `while`, `do:` |
+| Error Handling  | `quarantine try { ... } replace { ... } erase { ... };` | Structured fallback |
+| Macros          | `@inline`, `@wraptry`, `@inject`         | Auto-expanding |
+
+Instryx avoids indentation-based scoping and favors **explicit structure**.
+
+---
+
+## 🚀 Advanced Features of Instryx
+
+Instryx is packed with cutting-edge compiler features:
+
+- **Dodecagram AST**: A base-12 tree structure for parsing
+- **Quarantine Error Model (T.R.E.)**: Try, Replace, Erase blocks
+- **CIAMS Macros**: Context-aware macro expansion
+- **Optimization Pipeline**:
+  - Constant folding
+  - Dead code elimination
+  - Function inlining
+  - Tail call optimization
+- **Multitasking Constructs**:
+  - Hot swaps
+  - Dithered splits
+  - Threaded recursion
+- **Universal Compilation Targets**: `.exe`, `.elf`, `.wasm`, `.macho`
+
+These features make Instryx competitive with Rust, Go, and TypeScript.
+
+---
+
+## 🛠️ Debugging Help
+
+Instryx’s toolchain includes **macro debugging**, **error diagnostics**, and **performance metrics**. If you hit an error:
+
+1. **Check the error message**: It often includes line number and token type.
+2. **Use `@wraptry`** to isolate risky calls.
+3. **Insert `print:` statements** to trace variable values.
+4. **Use the REPL or shell UI** for interactive testing.
+5. **Enable macro debugger** to trace macro expansions.
+
+
+
+---
+
