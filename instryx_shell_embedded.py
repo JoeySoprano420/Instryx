@@ -883,3 +883,569 @@ def main():
 if __name__ == "__main__":
     main()
 
+    import os
+    os._exit(0)  # ensure all threads exit
+    import sys
+    sys.exit(0)
+    """
+    """
+    # instryx_shell_embedded.py
+    import os
+    os._exit(0)  # ensure all threads exit
+    import sys
+    sys.exit(0)
+    
+# instryx_shell_enhancements.py
+# Enhancements for instryx_shell_embedded.py:
+# - TaskManager (async background tasks with persistence)
+# - FileWatcher (watchdog if available, fallback to polling)
+# - MetricsServer (simple /metrics HTTP endpoint for Prometheus)
+# - Optional ncurses UI overlay for task monitoring
+#
+# Designed to be imported and used by instryx_shell_embedded.py
+
+from __future__ import annotations
+import asyncio
+import gzip
+import hashlib
+import json
+import os
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional
+
+# optional imports
+try:
+    from watchdog.observers import Observer  # type: ignore
+    from watchdog.events import FileSystemEventHandler  # type: ignore
+    _HAS_WATCHDOG = True
+except Exception:
+    _HAS_WATCHDOG = False
+
+try:
+    import curses  # type: ignore
+    _HAS_CURSES = True
+except Exception:
+    _HAS_CURSES = False
+
+# persistent cache dir for shell
+CACHE_DIR = Path.home() / ".instryx_shell_cache"
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+_TASKS_PERSIST = CACHE_DIR / "tasks.json"
+_TASKS_LOCK = threading.RLock()
+
+# simple global metrics store (prometheus-style counters)
+_metrics_lock = threading.RLock()
+_metrics: Dict[str, int] = {
+    "instryx_compile_requests_total": 0,
+    "instryx_compile_success_total": 0,
+    "instryx_compile_failure_total": 0,
+    "instryx_run_requests_total": 0,
+    "instryx_run_success_total": 0,
+    "instryx_run_failure_total": 0,
+}
+
+# threadpool to run blocking work from shell
+_BLOCKING_POOL = ThreadPoolExecutor(max_workers=4)
+
+
+class TaskManager:
+    """
+    Lightweight TaskManager.
+    create(label, coro_func) -> tid
+    list() -> dict of metadata
+    cancel(tid) -> bool
+    Persist metadata to disk to remain inspectable across shell restarts.
+    """
+
+    def __init__(self):
+        self._tasks: Dict[str, Dict[str, Any]] = {}
+        self._lock = threading.RLock()
+        self._load()
+
+    def _load(self):
+        try:
+            if _TASKS_PERSIST.exists():
+                with _TASKS_LOCK:
+                    self._tasks = json.loads(_TASKS_PERSIST.read_text(encoding="utf-8"))
+        except Exception:
+            self._tasks = {}
+
+    def _save(self):
+        try:
+            with _TASKS_LOCK:
+                _TASKS_PERSIST.write_text(json.dumps(self._tasks, default=str, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+    def create(self, label: str, coro_fn: Callable[[], Any]) -> str:
+        tid = hashlib.sha1(f"{label}:{time.time()}".encode()).hexdigest()[:12]
+        meta = {
+            "id": tid,
+            "label": label,
+            "status": "queued",
+            "start_ts": None,
+            "finish_ts": None,
+            "result": None,
+        }
+        with self._lock:
+            self._tasks[tid] = meta
+            self._save()
+
+        async def _runner():
+            meta["status"] = "running"
+            meta["start_ts"] = time.time()
+            self._save()
+            try:
+                res = await coro_fn()
+                meta["status"] = "done"
+                meta["result"] = {"ok": True, "value": res}
+            except asyncio.CancelledError:
+                meta["status"] = "cancelled"
+            except Exception as e:
+                meta["status"] = "error"
+                meta["result"] = {"ok": False, "error": str(e)}
+            meta["finish_ts"] = time.time()
+            self._save()
+
+        task = asyncio.create_task(_runner())
+        with self._lock:
+            self._tasks[tid]["task_ref"] = task
+            self._save()
+        return tid
+
+    def list(self) -> Dict[str, Dict[str, Any]]:
+        with self._lock:
+            out = {}
+            for k, v in self._tasks.items():
+                copyv = dict(v)
+                copyv.pop("task_ref", None)
+                out[k] = copyv
+            return out
+
+    def cancel(self, tid: str) -> bool:
+        with self._lock:
+            entry = self._tasks.get(tid)
+            if not entry:
+                return False
+            tref = entry.get("task_ref")
+            if tref and not tref.done():
+                tref.cancel()
+                entry["status"] = "cancelling"
+                self._save()
+                return True
+        return False
+
+
+class _PollingWatcher(threading.Thread):
+    """Lightweight fallback watcher (polling)."""
+
+    def __init__(self, callback: Callable[[str], None], poll_interval: float = 0.5):
+        super().__init__(daemon=True)
+        self._watched: Dict[str, float] = {}
+        self._cb = callback
+        self._interval = poll_interval
+        self._stop = threading.Event()
+
+    def watch(self, path: str):
+        p = Path(path)
+        self._watched[path] = p.stat().st_mtime if p.exists() else 0.0
+
+    def unwatch(self, path: str):
+        self._watched.pop(path, None)
+        if not self._watched:
+            self._stop.set()
+
+    def run(self):
+        while not self._stop.is_set() and self._watched:
+            for p, last in list(self._watched.items()):
+                try:
+                    if Path(p).exists():
+                        m = Path(p).stat().st_mtime
+                        if m != last:
+                            self._watched[p] = m
+                            try:
+                                self._cb(p)
+                            except Exception:
+                                pass
+                    else:
+                        self._watched.pop(p, None)
+                except Exception:
+                    continue
+            time.sleep(self._interval)
+
+    def stop(self):
+        self._stop.set()
+
+
+class FileWatcher:
+    """
+    FileWatcher that uses watchdog when available; falls back to polling otherwise.
+
+    API:
+      fw = FileWatcher()
+      fw.watch(path, callback)
+      fw.unwatch(path)
+    """
+
+    def __init__(self):
+        self._poller: Optional[_PollingWatcher] = None
+        self._observer = None
+        self._handlers: Dict[str, Callable[[str], None]] = {}
+        if _HAS_WATCHDOG:
+            class _Handler(FileSystemEventHandler):
+                def __init__(self, outer):
+                    super().__init__()
+                    self._outer = outer
+
+                def on_modified(self, event):
+                    if not event.is_directory:
+                        cb = self._outer._handlers.get(event.src_path)
+                        if cb:
+                            try:
+                                cb(event.src_path)
+                            except Exception:
+                                pass
+
+                def on_created(self, event):
+                    if not event.is_directory:
+                        cb = self._outer._handlers.get(event.src_path)
+                        if cb:
+                            try:
+                                cb(event.src_path)
+                            except Exception:
+                                pass
+            self._wd_handler_cls = _Handler
+        else:
+            self._wd_handler_cls = None
+
+    def watch(self, path: str, callback: Callable[[str], None]):
+        path = str(Path(path).resolve())
+        self._handlers[path] = callback
+        if _HAS_WATCHDOG:
+            if self._observer is None:
+                self._observer = Observer()
+                self._observer.start()
+            handler = self._wd_handler_cls(self)
+            self._observer.schedule(handler, os.path.dirname(path) or ".", recursive=False)
+        else:
+            if self._poller is None or not self._poller.is_alive():
+                self._poller = _PollingWatcher(callback)
+                self._poller.start()
+            self._poller.watch(path)
+
+    def unwatch(self, path: str):
+        path = str(Path(path).resolve())
+        self._handlers.pop(path, None)
+        if _HAS_WATCHDOG and self._observer:
+            # watchdog doesn't provide per-path unschedule easily here; best-effort leave running
+            pass
+        else:
+            if self._poller:
+                self._poller.unwatch(path)
+
+    def stop(self):
+        if _HAS_WATCHDOG and self._observer:
+            try:
+                self._observer.stop()
+                self._observer.join(timeout=1.0)
+            except Exception:
+                pass
+        if self._poller:
+            self._poller.stop()
+
+
+# Simple HTTP metrics endpoint for Prometheus
+@dataclass
+class MetricsServer:
+    host: str = "127.0.0.1"
+    port: int = 8001
+    _server: Optional[threading.Thread] = None
+    _httpd: Any = None
+
+    def _make_handler(self):
+        metrics_ref = _metrics
+        metrics_lock = _metrics_lock
+
+        class _Handler(http.server.BaseHTTPRequestHandler):  # type: ignore
+            def do_GET(self):
+                if self.path != "/metrics":
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                with metrics_lock:
+                    payload = "\n".join(f"{k} {v}" for k, v in metrics_ref.items()) + "\n"
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; version=0.0.4")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload.encode("utf-8"))
+
+            def log_message(self, format, *args):
+                return  # silence
+
+        return _Handler
+
+    def start(self):
+        if self._server and self._server.is_alive():
+            return
+        handler = self._make_handler()
+        import socketserver
+        self._httpd = socketserver.TCPServer((self.host, self.port), handler)
+        def _serve():
+            try:
+                self._httpd.serve_forever()
+            except Exception:
+                pass
+        self._server = threading.Thread(target=_serve, daemon=True)
+        self._server.start()
+
+    def stop(self):
+        if self._httpd:
+            try:
+                self._httpd.shutdown()
+            except Exception:
+                pass
+        if self._server:
+            self._server.join(timeout=1.0)
+
+
+# Simple ncurses UI for viewing tasks (optional)
+def start_tasks_ui(task_mgr: TaskManager):
+    if not _HAS_CURSES:
+        raise RuntimeError("curses not available on this platform")
+    import curses
+
+    def _ui(stdscr):
+        curses.curs_set(0)
+        stdscr.nodelay(True)
+        while True:
+            stdscr.erase()
+            tasks = task_mgr.list()
+            stdscr.addstr(0, 0, "Instryx Tasks (q to quit)".ljust(80), curses.A_REVERSE)
+            row = 1
+            for tid, meta in tasks.items():
+                label = meta.get("label", "")[:40]
+                status = meta.get("status", "")
+                start_ts = meta.get("start_ts") or ""
+                finish_ts = meta.get("finish_ts") or ""
+                line = f"{tid} {label:40} {status:10} start={start_ts} finish={finish_ts}"
+                stdscr.addstr(row, 0, line[:curses.COLS-1])
+                row += 1
+                if row >= curses.LINES - 1:
+                    break
+            stdscr.refresh()
+            try:
+                ch = stdscr.getch()
+                if ch in (ord("q"), ord("Q")):
+                    break
+            except Exception:
+                pass
+            time.sleep(0.2)
+
+    curses.wrapper(_ui)
+
+# tests/test_shell_enhancements.py
+# Unit tests for TaskManager and FileWatcher (fallback behavior)
+import asyncio
+import os
+import tempfile
+import time
+import unittest
+from pathlib import Path
+
+from instryx_shell_enhancements import TaskManager, FileWatcher, MetricsServer, _metrics, _metrics_lock
+
+class TestTaskManager(unittest.IsolatedAsyncioTestCase):
+    async def test_create_and_complete_task(self):
+        tm = TaskManager()
+        async def coro():
+            await asyncio.sleep(0.01)
+            return "ok"
+        tid = tm.create("quick", coro)
+        # wait until task finishes
+        for _ in range(100):
+            lst = tm.list()
+            if lst[tid]["status"] in ("done", "error"):
+                break
+            await asyncio.sleep(0.01)
+        lst = tm.list()
+        self.assertIn(tid, lst)
+        self.assertIn(lst[tid]["status"], ("done", "error"))
+
+    async def test_cancel(self):
+        tm = TaskManager()
+        async def long_coro():
+            await asyncio.sleep(2)
+            return "done"
+        tid = tm.create("long", long_coro)
+        # cancel immediately
+        ok = tm.cancel(tid)
+        self.assertTrue(ok)
+        # wait a bit
+        await asyncio.sleep(0.05)
+        lst = tm.list()
+        self.assertIn(tid, lst)
+        self.assertIn(lst[tid]["status"], ("cancelling", "cancelled", "done", "error"))
+
+class TestFileWatcher(unittest.TestCase):
+    def test_polling_watch(self):
+        fw = FileWatcher()
+        tf = tempfile.NamedTemporaryFile(delete=False)
+        path = tf.name
+        tf.write(b"hello")
+        tf.flush()
+        tf.close()
+        seen = []
+        def cb(p):
+            seen.append(p)
+        try:
+            fw.watch(path, cb)
+            # modify file
+            time.sleep(0.1)
+            with open(path, "w") as f:
+                f.write("changed")
+            # wait for callback
+            for _ in range(50):
+                if seen:
+                    break
+                time.sleep(0.05)
+            self.assertTrue(len(seen) >= 1)
+        finally:
+            try:
+                fw.unwatch(path)
+            except Exception:
+                pass
+            try:
+                os.unlink(path)
+            except Exception:
+                pass
+
+class TestMetricsServer(unittest.TestCase):
+    def test_metrics_endpoint(self):
+        ms = MetricsServer(host="127.0.0.1", port=18081)
+        ms.start()
+        try:
+            # increment a metric
+            with _metrics_lock:
+                _metrics["instryx_compile_requests_total"] += 1
+            import urllib.request
+            res = urllib.request.urlopen("http://127.0.0.1:18081/metrics")
+            body = res.read().decode()
+            self.assertIn("instryx_compile_requests_total", body)
+        finally:
+            ms.stop()
+
+if __name__ == "__main__":
+    unittest.main()
+
+# (append) Integration glue for the new enhancements module
+# This block can be appended to the end of instryx_shell_embedded.py to wire in the new features.
+try:
+    from instryx_shell_enhancements import TaskManager, FileWatcher, MetricsServer, start_tasks_ui, _metrics, _metrics_lock
+except Exception:
+    TaskManager = None
+    FileWatcher = None
+    MetricsServer = None
+    start_tasks_ui = None
+
+# Attach optional instances and commands to InstryxShell by monkey-patching if available.
+if TaskManager is not None and FileWatcher is not None:
+    def _attach_enhancements(shell_cls):
+        # provide lazy-initialized components on shell instances
+        def _ensure_components(self):
+            if not hasattr(self, "task_mgr"):
+                self.task_mgr = TaskManager()
+            if not hasattr(self, "file_watcher"):
+                self.file_watcher = FileWatcher()
+            if not hasattr(self, "metrics_server"):
+                self.metrics_server = None
+        shell_cls._ensure_components = _ensure_components
+
+        async def _wrap_coro(fn):
+            # helper to adapt blocking functions to coroutine for TaskManager
+            return await fn()
+
+        def cmd_tasks(self, _args):
+            self._ensure_components()
+            tasks = self.task_mgr.list()
+            if not tasks:
+                print("No background tasks")
+                return
+            for tid, meta in tasks.items():
+                print(f"{tid} {meta.get('label')} status={meta.get('status')} start={meta.get('start_ts')} finish={meta.get('finish_ts')}")
+        shell_cls.cmd_tasks = cmd_tasks
+
+        def cmd_task_cancel(self, args):
+            if not args:
+                print("Usage: :task.cancel <id>")
+                return
+            self._ensure_components()
+            ok = self.task_mgr.cancel(args[0])
+            print("cancelled" if ok else "not found or already done")
+        shell_cls.cmd_task_cancel = cmd_task_cancel
+
+        def cmd_watch(self, args):
+            if not args:
+                print("Usage: :watch <file>")
+                return
+            self._ensure_components()
+            path = args[0]
+            def cb(p):
+                print(f"[watch] change detected: {p}")
+                try:
+                    txt = Path(p).read_text(encoding="utf-8")
+                    self.source_original = txt
+                    self.source_morphed = None
+                    self.source_expanded = None
+                    print("[watch] reloaded source buffer")
+                except Exception as e:
+                    print("[watch] reload failed:", e)
+            self.file_watcher.watch(path, cb)
+            print(f"Watching {path} for changes")
+        shell_cls.cmd_watch = cmd_watch
+
+        def cmd_metrics_start(self, args):
+            host = args[0] if args else "127.0.0.1"
+            port = int(args[1]) if len(args) > 1 else 8001
+            self._ensure_components()
+            if getattr(self, "metrics_server", None) is None:
+                self.metrics_server = MetricsServer(host=host, port=port)
+                self.metrics_server.start()
+                print(f"metrics server started at http://{host}:{port}/metrics")
+            else:
+                print("metrics server already running")
+        shell_cls.cmd_metrics_start = cmd_metrics_start
+
+        def cmd_metrics_stop(self, _args):
+            if getattr(self, "metrics_server", None):
+                try:
+                    self.metrics_server.stop()
+                except Exception:
+                    pass
+                self.metrics_server = None
+                print("metrics server stopped")
+            else:
+                print("metrics server not running")
+        shell_cls.cmd_metrics_stop = cmd_metrics_stop
+
+        def cmd_tasks_ui(self, _args):
+            self._ensure_components()
+            if start_tasks_ui is None:
+                print("ncurses UI not available on this platform")
+                return
+            try:
+                start_tasks_ui(self.task_mgr)
+            except Exception as e:
+                print("tasks UI failed:", e)
+        shell_cls.cmd_tasks_ui = cmd_tasks_ui
+
+    try:
+        _attach_enhancements(InstryxShell)
+    except Exception:
+        pass
+
