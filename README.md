@@ -1912,3 +1912,131 @@ Summary — final wrap-up:
 •	Start SQL plugin self-check / scan (CLI):
 •	python ciams/ciams_plugins/sql_security_plugin.py --self-check
 This codebase is self-contained and ready for integration, testing, and extension; inspect each module's __main__ and docstrings for further usage details.
+
+## -----
+
+This file, **toolchain.py**, from the [JoeySoprano420/Instryx](https://github.com/JoeySoprano420/Instryx) repo, is the main compiler/interpreter toolchain implementation for the Instryx programming language. It is a very large, multi-purpose source file that contains the language’s:
+
+- **Lexer** (tokenizer)
+- **Parser** (AST builder)
+- **AST node types**
+- **Code generator (LLVM IR and more)**
+- **Interpreter**
+- **Macro system**
+- **Helper code generators**
+- **Diagnostic/scanner for SQL injection**
+- **Metrics and plugin infrastructure**
+- **File watcher, REPL, and shell UI**
+- **Heap garbage collector**
+- **WASM runtime**
+- **Optimizer passes (CSE, inlining, dead store removal, etc.)**
+- **Many utility functions**
+
+## ---
+
+## 1. **Lexical Analysis (Lexer)**
+- **`InstryxLexer`**: Tokenizes Instryx source code into tokens.
+  - Supports emitting positions (line/col), skipping comments/whitespace, and caching results.
+  - Multiple token shapes: simple `(type, value)` and with position `(type, value, lineno, col)`.
+  - Helper methods for tokenization, position computation, and configuration via `LexerConfig`.
+
+---
+
+## 2. **Parsing (Parser)**
+- **`InstryxParser`**: Converts tokens into an Abstract Syntax Tree (AST).
+  - Implements recursive descent parsing for statements, blocks, expressions, functions, control flow, macros, and more.
+  - AST nodes are instances of `ASTNode`, with fields for type, value, children, and location.
+  - Methods for error handling, recovery, pretty printing, constant folding, etc.
+
+---
+
+## 3. **AST Representation**
+- **`ASTNode`**: Represents a node in the syntax tree.
+  - Fields: `node_type`, `value`, `children`, `lineno`, `col`, `span`.
+  - Methods for dict conversion, pretty printing, and (sometimes) source mapping.
+
+---
+
+## 4. **Code Generation**
+- **`InstryxLLVMCodegen`**: Emits LLVM IR code from the AST.
+  - Handles functions, main blocks, expressions, assignments, binary ops, calls, control flow, etc.
+  - Supports object file emission, module verification, optimization, built-in functions, and more.
+  - Uses configuration via `CodegenConfig`.
+
+---
+
+## 5. **Interpreter**
+- **`InstryxInterpreter`**: Directly executes the AST in Python.
+  - Handles variable frames, built-in functions, macros, control flow signals (return/break/continue).
+  - Evaluates nodes recursively, supports hooks for debugging/profiling.
+
+---
+
+## 6. **Macros and Helpers**
+- **Macro system**: Allows source-level macros, code helpers, and pattern expansion.
+  - Registry and application functions support macro discovery, expansion, diagnostics, and overlays.
+  - Many code generation helpers for loops, memoization, SIMD, vectorization, transactional guards, etc.
+
+---
+
+## 7. **Match/Enum/Struct Tools**
+- **Parser and generator for enums/structs**: Find enums/structs in code and emit match/destructuring stubs/macros.
+- **`DMatchTool`**: Utility for generating, injecting, and patching code with match stubs.
+
+---
+
+## 8. **File Operations, Watching, and Shell**
+- **File watcher**: Polls for file changes or uses OS events for hot reload.
+- **Shell/REPL**: Interactive command line with history, plugins, background tasks, metrics, and helpers.
+
+---
+
+## 9. **Garbage Collector**
+- **`HeapGCAllocator`**: Implements a generational garbage collector for heap-allocated objects.
+  - Handles minor/major collections, finalizers, compaction, roots, pinning, background workers, metrics, etc.
+
+---
+
+## 10. **WASM Host Runtime**
+- **`WasmHostRuntime`**: Executes WASM modules with host-registered functions.
+  - Handles logging, system calls, time, memory management for WASM modules.
+
+---
+
+## 11. **Optimization Passes and Plugins**
+- Many **optimizer plugins** for IR:
+  - Constant folding, propagation, copy propagation, CFG simplification, inlining, profile-guided inlining, specialization, loop unrolling, vectorization, prefetch hints, peephole optimizations, SSA conversion, tail call elimination, macro awareness.
+- **PluginRegistry**: Infrastructure for registering, running, and caching plugin passes.
+
+---
+
+## 12. **SQL Scanner/Diagnostics**
+- Functions for scanning Python/Instryx code for SQL injection risks.
+  - Rules for f-string/concatenation, dynamic table names, missing parameters, etc.
+  - Suggestion objects for diagnostics, caching, and reporting.
+
+---
+
+## 13. **Utilities**
+- Many helpers for cache management, diffing, file atomic write, metrics servers, HTTP endpoints, etc.
+
+---
+
+## 14. **Testing and Self-Check**
+- **Unit tests** for task management, file watching, metrics, and heap GC.
+- **Self-check functions** for diagnostics.
+
+---
+
+## 15. **Entrypoints**
+- Multiple CLI and shell main functions for launching the toolchain as a CLI, REPL, LSP server, test runner, etc.
+
+---
+
+# **Summary**
+
+This file is essentially the core toolkit for the **Instryx** language:
+- It can **tokenize, parse, build, generate, and interpret** Instryx code.
+- It encompasses advanced infrastructure for **macros, code helpers, SQL diagnostics, optimization, garbage collection, WASM, and shell UI**.
+- It is highly modular, with many classes and functions supporting **expansion, plugin-based transformation, and live diagnostics**.
+
